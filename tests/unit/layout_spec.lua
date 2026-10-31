@@ -372,6 +372,21 @@ local function with_restore_env(options, fn)
     end
 end
 
+local function with_settle_env(value, fn)
+    local real_getenv = os.getenv
+    os.getenv = function(name)
+        if name == "WEZTERM_SESSION_SELFCHECK_SETTLE_MS" then
+            return value
+        end
+        return real_getenv(name)
+    end
+    local ok, err = pcall(fn)
+    os.getenv = real_getenv
+    if not ok then
+        error(err, 0)
+    end
+end
+
 local function find_event(events, name)
     for _, event in ipairs(events) do
         if event.event == name then
@@ -1311,22 +1326,24 @@ return {
     {
         name = "a reported cwd mismatch keeps driving drift and status after the settle window",
         run = function(t)
-            with_restore_env({}, function(env, events)
-                local calls = 0
-                with_stub(layout, "selfcheck", function()
-                    calls = calls + 1
-                    return { { kind = "cwd", tab = 1, pane = 10 } }
-                end, function()
-                    t.eq(layout.restore(nil, sample_restore_state()), true)
+            with_settle_env(nil, function()
+                with_restore_env({}, function(env, events)
+                    local calls = 0
+                    with_stub(layout, "selfcheck", function()
+                        calls = calls + 1
+                        return { { kind = "cwd", tab = 1, pane = 10 } }
+                    end, function()
+                        t.eq(layout.restore(nil, sample_restore_state()), true)
+                    end)
+                    t.eq(calls, 101, "one immediate check plus one hundred settle steps")
+                    t.eq(env.spawn.window.statuses, { " restore drift: 1 ", "" })
+                    local drift = find_event(events, "selfcheck.drift")
+                    t.ok(drift ~= nil)
+                    t.eq(drift.fields.count, 1)
+                    t.eq(drift.fields.kinds, "cwd")
+                    t.eq(drift.fields.timed_out, true)
+                    t.eq(#env.windows, 1, "a cwd timeout must never fall back")
                 end)
-                t.eq(calls, 101, "one immediate check plus one hundred settle steps")
-                t.eq(env.spawn.window.statuses, { " restore drift: 1 ", "" })
-                local drift = find_event(events, "selfcheck.drift")
-                t.ok(drift ~= nil)
-                t.eq(drift.fields.count, 1)
-                t.eq(drift.fields.kinds, "cwd")
-                t.eq(drift.fields.timed_out, true)
-                t.eq(#env.windows, 1, "a cwd timeout must never fall back")
             end)
         end,
     },
@@ -1414,24 +1431,105 @@ return {
     {
         name = "a cwd that never reports logs cwd_unknown without status or drift",
         run = function(t)
-            with_restore_env({}, function(env, events)
-                local calls = 0
-                with_stub(layout, "selfcheck", function()
-                    calls = calls + 1
-                    return {}, { { tab = 1, pane = 10 } }
-                end, function()
-                    t.eq(layout.restore(nil, sample_restore_state()), true)
+            with_settle_env(nil, function()
+                with_restore_env({}, function(env, events)
+                    local calls = 0
+                    with_stub(layout, "selfcheck", function()
+                        calls = calls + 1
+                        return {}, { { tab = 1, pane = 10 } }
+                    end, function()
+                        t.eq(layout.restore(nil, sample_restore_state()), true)
+                    end)
+                    t.eq(calls, 101)
+                    t.eq(env.spawn.window.statuses, {})
+                    t.eq(find_event(events, "selfcheck.drift"), nil)
+                    local unknown_event = find_event(events, "selfcheck.cwd_unknown")
+                    t.ok(unknown_event ~= nil)
+                    t.eq(unknown_event.level, "info")
+                    t.eq(unknown_event.fields.count, 1)
+                    t.eq(unknown_event.fields.tab, 1)
+                    t.eq(unknown_event.fields.pane, 10)
+                    t.eq(#env.windows, 1)
                 end)
-                t.eq(calls, 101)
-                t.eq(env.spawn.window.statuses, {})
-                t.eq(find_event(events, "selfcheck.drift"), nil)
-                local unknown_event = find_event(events, "selfcheck.cwd_unknown")
-                t.ok(unknown_event ~= nil)
-                t.eq(unknown_event.level, "info")
-                t.eq(unknown_event.fields.count, 1)
-                t.eq(unknown_event.fields.tab, 1)
-                t.eq(unknown_event.fields.pane, 10)
-                t.eq(#env.windows, 1)
+            end)
+        end,
+    },
+    {
+        name = "the self-check settle window defaults to ten seconds",
+        run = function(t)
+            with_settle_env(nil, function()
+                with_restore_env({}, function(env, events)
+                    local calls = 0
+                    with_stub(layout, "selfcheck", function()
+                        calls = calls + 1
+                        return { { kind = "cwd", tab = 1, pane = 10 } }
+                    end, function()
+                        t.eq(layout.restore(nil, sample_restore_state()), true)
+                    end)
+                    t.eq(calls, 101, "100 steps of 100ms plus the immediate check")
+                    local drift = find_event(events, "selfcheck.drift")
+                    t.ok(drift ~= nil)
+                    t.eq(drift.fields.timed_out, true)
+                end)
+            end)
+        end,
+    },
+    {
+        name = "a valid self-check settle override is honoured",
+        run = function(t)
+            with_settle_env("500", function()
+                with_restore_env({}, function(env, events)
+                    local calls = 0
+                    with_stub(layout, "selfcheck", function()
+                        calls = calls + 1
+                        return { { kind = "cwd", tab = 1, pane = 10 } }
+                    end, function()
+                        t.eq(layout.restore(nil, sample_restore_state()), true)
+                    end)
+                    t.eq(calls, 6, "5 steps of 100ms plus the immediate check")
+                    t.ok(find_event(events, "selfcheck.drift") ~= nil)
+                end)
+            end)
+        end,
+    },
+    {
+        name = "invalid or zero self-check settle values fall back to the default",
+        run = function(t)
+            for _, value in ipairs({ "", "abc", "0", "-5", "1.5" }) do
+                with_settle_env(value, function()
+                    with_restore_env({}, function()
+                        local calls = 0
+                        with_stub(layout, "selfcheck", function()
+                            calls = calls + 1
+                            return { { kind = "cwd", tab = 1, pane = 10 } }
+                        end, function()
+                            t.eq(layout.restore(nil, sample_restore_state()), true)
+                        end)
+                        t.eq(calls, 101, "value " .. value .. " must use the default")
+                    end)
+                end)
+            end
+        end,
+    },
+    {
+        name = "early exit still works at a small settle window",
+        run = function(t)
+            with_settle_env("300", function()
+                with_restore_env({}, function(env, events)
+                    local calls = 0
+                    with_stub(layout, "selfcheck", function()
+                        calls = calls + 1
+                        if calls <= 2 then
+                            return { { kind = "cwd", tab = 1, pane = 10 } }
+                        end
+                        return {}
+                    end, function()
+                        t.eq(layout.restore(nil, sample_restore_state()), true)
+                    end)
+                    t.eq(calls, 3, "must stop as soon as the cwd matches, not wait out the window")
+                    t.eq(env.spawn.window.statuses, {})
+                    t.eq(find_event(events, "selfcheck.drift"), nil)
+                end)
             end)
         end,
     },

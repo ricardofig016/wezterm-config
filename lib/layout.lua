@@ -392,10 +392,38 @@ end
 
 local STATUS_CLEAR_SECONDS = 4
 local SELFCHECK_KINDS_SHOWN = 3
--- About ten seconds in short steps: a cold first pwsh prompt can take longer
--- than the old two-second window before it reports its directory.
-local SELFCHECK_SETTLE_STEPS = 100
+-- Production waits about ten seconds in short steps: a cold first pwsh prompt
+-- can take longer than the old two-second window before it reports its
+-- directory. Tests shrink the window with WEZTERM_SESSION_SELFCHECK_SETTLE_MS;
+-- the value is read once per restore, clamped, and anything malformed falls
+-- back to the default.
+local DEFAULT_SELFCHECK_SETTLE_MS = 10000
+local MIN_SELFCHECK_SETTLE_MS = 100
+local MAX_SELFCHECK_SETTLE_MS = 60000
+local SELFCHECK_STEP_MS = 100
 local SELFCHECK_SETTLE_SECONDS = 0.1
+
+local function selfcheck_settle_steps()
+    local ok, raw = pcall(os.getenv, "WEZTERM_SESSION_SELFCHECK_SETTLE_MS")
+    local milliseconds = ok and tonumber(raw) or nil
+    if
+        type(milliseconds) ~= "number"
+        or milliseconds ~= math.floor(milliseconds)
+        or milliseconds <= 0
+    then
+        milliseconds = DEFAULT_SELFCHECK_SETTLE_MS
+    end
+    if milliseconds < MIN_SELFCHECK_SETTLE_MS then
+        milliseconds = MIN_SELFCHECK_SETTLE_MS
+    elseif milliseconds > MAX_SELFCHECK_SETTLE_MS then
+        milliseconds = MAX_SELFCHECK_SETTLE_MS
+    end
+    local steps = math.floor(milliseconds / SELFCHECK_STEP_MS)
+    if steps < 1 then
+        steps = 1
+    end
+    return steps
+end
 
 -- Status and timer calls are best effort: a missing status area, a closed
 -- window or an odd clock must never turn a self-check or a fallback into a
@@ -484,7 +512,7 @@ local function log_unknown(unknown)
     })
 end
 
-local function check_selfcheck(window, report, attempt)
+local function check_selfcheck(window, report, attempt, settle_steps)
     local checked, findings, unknown = pcall(M.selfcheck, report)
     if not checked then
         log.warn("selfcheck.failed", { error = tostring(findings) })
@@ -503,14 +531,14 @@ local function check_selfcheck(window, report, attempt)
         return
     end
 
-    if attempt >= SELFCHECK_SETTLE_STEPS then
+    if attempt >= settle_steps then
         report_findings(window, findings, drifted)
         log_unknown(unknown)
         return
     end
 
     local scheduled = pcall(wezterm.time.call_after, SELFCHECK_SETTLE_SECONDS, function()
-        check_selfcheck(window, report, attempt + 1)
+        check_selfcheck(window, report, attempt + 1, settle_steps)
     end)
     if not scheduled then
         report_findings(window, findings, drifted)
@@ -779,7 +807,8 @@ function M.restore(cmd, latest)
 
     -- A self-check problem is logged but never escalates into a fallback: the
     -- layout is already usable and a broken status area must not lose it.
-    local wired = pcall(check_selfcheck, window, report, 0)
+    local settle_steps = selfcheck_settle_steps()
+    local wired = pcall(check_selfcheck, window, report, 0, settle_steps)
     if not wired then
         log.warn("selfcheck.failed", { error = "self-check wiring raised" })
     end
