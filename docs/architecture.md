@@ -204,21 +204,31 @@ splits in plan order with cwd and the history key". The shell suite cases
 
 ## The settle window and a silent clean restore
 
-After restore, `layout.selfcheck` compares every live title, rectangle, cwd and
-pane id against the report built from the plan. Rectangles allow one cell of
-slack per edge; titles must match exactly; cwd comparison normalizes slashes,
-case and a trailing separator. A missing pane is a finding. Layout spec:
-"selfcheck accepts a one-cell drift and normalizes cwd URLs", "selfcheck
-reports a rectangle drift beyond one cell", "selfcheck reports a cwd mismatch",
-"selfcheck reports a title mismatch as a tab finding".
+After restore, `layout.selfcheck` compares every live title, rectangle and pane
+id against the report built from the plan, and compares a pane's cwd only once
+the pane has reported one. Rectangles allow one cell of slack per edge; titles
+must match exactly; a missing pane is a finding. Cwd comparison normalizes
+slashes, case and a trailing separator. Layout spec: "selfcheck accepts a
+one-cell drift and normalizes cwd URLs", "selfcheck reports a rectangle drift
+beyond one cell", "selfcheck reports a cwd mismatch", "selfcheck reports a
+title mismatch as a tab finding".
 
-Titles, rectangles and missing panes are stable as soon as the panes exist.
-Cwd is not. A freshly split pane reports the cwd handed to `pane:split` only
-after its shell or the foreground process query catches up. When a cwd finding
-is present, the check retries every 0.1 seconds, up to 20 times, then reports
-all remaining findings with `timed_out` set. Layout spec: "a clean check
-settles immediately and stays silent", "a cwd that settles after one step stays
-silent", "a cwd that never settles is reported after the timeout".
+Titles, rectangles and missing panes are stable as soon as the panes exist. Cwd
+is not. A freshly split pane reports the cwd handed to `pane:split` only after
+its shell or the foreground process query catches up. `get_current_working_dir`
+returning nil, an empty string, or a Url with an empty file path means "not yet
+reported": it is unknown, not a finding, and it never drives the status. The
+check retries every 0.1 seconds for up to 100 steps (about ten seconds) and
+stops as soon as every pane has reported and matches. At the timeout a reported
+value that still differs is genuine drift: it logs `selfcheck.drift` with the
+count, up to three finding kinds, the tab and the first pane, sets `timed_out`,
+and flashes ` restore drift: N `. Panes that never reported are logged
+separately at info level as `selfcheck.cwd_unknown` with their count, and never
+touch the status. Layout spec: "a clean check settles immediately and stays
+silent", "a cwd that settles after one step stays silent", "an unreported cwd is
+unknown, not a finding", "an unreported cwd that arrives late stays silent", "a
+cwd that never reports logs cwd_unknown without status or drift", "a reported
+cwd mismatch keeps driving drift and status after the settle window".
 
 A clean restore must be silent. The status area is shared with save, and a
 check that flashed on every clean start would make a real drift message
@@ -279,8 +289,9 @@ scenario. The claims above map to named cases: `tests\unit\state_spec.lua`
 "read_latest picks the largest saved_at and breaks ties by instance id" and "a
 truncated temporary file leaves the previous state intact";
 `tests\unit\layout_spec.lua` "plan round-trips one to eight panes at zero
-tolerance", "a clean restore stays quiet" and "a cwd that never settles is
-reported after the timeout"; `tests\unit\save_spec.lua` "the debounce writes
+tolerance", "a clean restore stays quiet", "an unreported cwd is unknown, not a
+finding" and "a reported cwd mismatch keeps driving drift and status after the
+settle window"; `tests\unit\save_spec.lua` "the debounce writes
 after two stable seconds and not while idle"; the shell cases `restored-key`,
 `pane-fallback` and `no-key`; and the integration scenarios `full_restore`,
 `selfcheck_drift` and `fixture_roundtrip`. The plan behind the layer lives in
