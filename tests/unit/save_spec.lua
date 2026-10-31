@@ -184,7 +184,7 @@ end
 
 return {
     {
-        name = "collect reads tabs, titles, pane rects, cwds, active indices and dimensions",
+        name = "collect reads tabs, titles, pane rects, cwds, active tab position and active pane id",
         run = function(t)
             local first = fake_pane({
                 id = 11,
@@ -230,7 +230,7 @@ return {
                 cols = 120,
                 rows = 24,
                 active_tab = 2,
-                active_pane = 1,
+                active_pane = 21,
             })
             t.eq(#snapshot.tabs, 2)
             t.eq(snapshot.tabs[1].title, "editor")
@@ -363,7 +363,7 @@ return {
         end,
     },
     {
-        name = "active indices are one-based positions in the saved arrays",
+        name = "active tab is a one-based position while active pane is a pane id",
         run = function(t)
             local first = fake_pane({ id = 1, cwd = "/C:/one" })
             local second = fake_pane({ id = 2, cwd = "/C:/two" })
@@ -388,7 +388,11 @@ return {
             t.ok(snapshot ~= nil, tostring(err))
             t.eq(snapshot.window.cols, 100, "the active tab, not another tab, sets the window cell width")
             t.eq(snapshot.window.active_tab, 2)
-            t.eq(snapshot.window.active_pane, 2)
+            t.eq(
+                snapshot.window.active_pane,
+                3,
+                "active_pane must be the active pane id, not its position of 2"
+            )
             t.eq(snapshot.tabs[2].panes[1].id, 2)
             t.eq(snapshot.tabs[2].panes[2].id, 3)
         end,

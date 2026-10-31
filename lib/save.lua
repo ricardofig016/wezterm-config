@@ -136,27 +136,31 @@ local function collect_tab(tab)
     end
 
     local active_index = 1
-    local active_pane
+    local active_pane_object
     for position, info in ipairs(infos) do
         if type(info) ~= "table" or info.pane == nil then
             error("pane info " .. tostring(position) .. " has no pane", 0)
         end
-        if info.is_active and active_pane == nil then
+        if info.is_active and active_pane_object == nil then
             active_index = position
-            active_pane = info.pane
+            active_pane_object = info.pane
         end
     end
-    if active_pane == nil then
-        active_pane = infos[active_index].pane
+    if active_pane_object == nil then
+        active_pane_object = infos[active_index].pane
     end
 
     local panes = {}
+    local active_pane_id
     local width, height = 0, 0
     for position, info in ipairs(infos) do
         local pane = info.pane
         local id_ok, id = pcall(pane.pane_id, pane)
         if not id_ok or type(id) ~= "number" then
             error("pane " .. tostring(position) .. " has no numeric id", 0)
+        end
+        if position == active_index then
+            active_pane_id = id
         end
         if
             type(info.left) ~= "number"
@@ -189,11 +193,16 @@ local function collect_tab(tab)
         width = math.max(width, info.left + info.width)
         height = math.max(height, info.top + info.height)
     end
+    if active_pane_id == nil then
+        error("active pane has no id", 0)
+    end
 
     return {
-        title = tab_title(tab, active_pane),
+        title = tab_title(tab, active_pane_object),
         panes = panes,
-        active_pane = active_index,
+        -- The schema records pane identity, not a position. A position would
+        -- point at the wrong pane whenever array order and ids diverge.
+        active_pane = active_pane_id,
         width = width,
         height = height,
     }
