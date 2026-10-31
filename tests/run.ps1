@@ -49,11 +49,10 @@ $script:suiteExit = 1
 $script:scenarioPassed = $false
 
 # ---------------------------------------------------------------------------
-# Unit suite: unchanged headless harness (tests\harness\unit.lua).
+# Unit suite: headless harness with a per-run report under %TEMP%.
 # ---------------------------------------------------------------------------
 function Invoke-UnitSuite {
     $harness = Join-Path $testsDir 'harness\unit.lua'
-    $report = Join-Path $testsDir '.report.json'
 
     $wezterm = Get-Command wezterm.exe -ErrorAction SilentlyContinue
     if (-not $wezterm) {
@@ -62,59 +61,71 @@ function Invoke-UnitSuite {
         return
     }
 
-    # The report is the only pass signal. Remove any old one first so a failed
-    # config load can never inherit a stale green result.
-    if (Test-Path -LiteralPath $report) {
-        Remove-Item -LiteralPath $report -Force
-    }
-
-    $showKeysExit = $null
-    try {
-        & $wezterm.Source --config-file $harness show-keys --lua 2>&1 | Out-Null
-        $showKeysExit = $LASTEXITCODE
-    } catch {
-        $showKeysExit = "launch error: $($_.Exception.Message)"
-    }
-
-    # show-keys exits 0 even when the config fails to load, so its exit code is
-    # diagnostic only. A missing report is a failure.
-    if (-not (Test-Path -LiteralPath $report)) {
-        Write-Output "FAIL unit: no report at $report (show-keys exit: $showKeysExit)"
-        $script:suiteExit = 1
-        return
-    }
+    # Every invocation gets its own report under %TEMP%. The harness writes to
+    # exactly the path passed here, so two runs can never read each other's
+    # verdict and the repository accumulates no report files.
+    $unitReportDir = Join-Path $env:TEMP ('wezterm-session-unit-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $unitReportDir -Force | Out-Null
+    $report = Join-Path $unitReportDir '.report.json'
+    $savedReport = $env:WEZTERM_SESSION_UNIT_REPORT
 
     try {
-        $result = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
-    } catch {
-        Write-Output "FAIL unit: report is not valid JSON: $($_.Exception.Message)"
+        if (Test-Path -LiteralPath $report) {
+            Remove-Item -LiteralPath $report -Force
+        }
+        $env:WEZTERM_SESSION_UNIT_REPORT = $report
+
+        $showKeysExit = $null
+        try {
+            & $wezterm.Source --config-file $harness show-keys --lua 2>&1 | Out-Null
+            $showKeysExit = $LASTEXITCODE
+        } catch {
+            $showKeysExit = "launch error: $($_.Exception.Message)"
+        }
+
+        # show-keys exits 0 even when the config fails to load, so its exit code
+        # is diagnostic only. A missing report is a failure.
+        if (-not (Test-Path -LiteralPath $report)) {
+            Write-Output "FAIL unit: no report at $report (show-keys exit: $showKeysExit)"
+            $script:suiteExit = 1
+            return
+        }
+
+        try {
+            $result = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+        } catch {
+            Write-Output "FAIL unit: report is not valid JSON: $($_.Exception.Message)"
+            $script:suiteExit = 1
+            return
+        }
+
+        $failures = @($result.failures)
+        $failed = [int]$result.failed
+        $passed = [int]$result.passed
+
+        foreach ($failure in $failures) {
+            $spec = if ($failure.spec) { [string]$failure.spec } else { '<unknown spec>' }
+            $test = if ($failure.test) { [string]$failure.test } else { '<unknown test>' }
+            $message = if ($failure.message) { [string]$failure.message } else { '<no message>' }
+            $message = $message -replace '\r?\n', ' '
+            Write-Output ("FAIL {0} :: {1} :: {2}" -f $spec, $test, $message)
+        }
+
+        if ($result.ok -eq $true -and $failed -eq 0 -and $failures.Count -eq 0) {
+            Write-Output ("PASS unit: {0} passed, 0 failed" -f $passed)
+            $script:suiteExit = 0
+            return
+        }
+
+        if ($failures.Count -eq 0) {
+            Write-Output ("FAIL unit: report ok={0}, failed={1}" -f $result.ok, $failed)
+        }
+        Write-Output ("FAIL unit: {0} passed, {1} failed" -f $passed, $failed)
         $script:suiteExit = 1
-        return
+    } finally {
+        $env:WEZTERM_SESSION_UNIT_REPORT = $savedReport
+        Remove-Item -LiteralPath $unitReportDir -Recurse -Force -ErrorAction SilentlyContinue
     }
-
-    $failures = @($result.failures)
-    $failed = [int]$result.failed
-    $passed = [int]$result.passed
-
-    foreach ($failure in $failures) {
-        $spec = if ($failure.spec) { [string]$failure.spec } else { '<unknown spec>' }
-        $test = if ($failure.test) { [string]$failure.test } else { '<unknown test>' }
-        $message = if ($failure.message) { [string]$failure.message } else { '<no message>' }
-        $message = $message -replace '\r?\n', ' '
-        Write-Output ("FAIL {0} :: {1} :: {2}" -f $spec, $test, $message)
-    }
-
-    if ($result.ok -eq $true -and $failed -eq 0 -and $failures.Count -eq 0) {
-        Write-Output ("PASS unit: {0} passed, 0 failed" -f $passed)
-        $script:suiteExit = 0
-        return
-    }
-
-    if ($failures.Count -eq 0) {
-        Write-Output ("FAIL unit: report ok={0}, failed={1}" -f $result.ok, $failed)
-    }
-    Write-Output ("FAIL unit: {0} passed, {1} failed" -f $passed, $failed)
-    $script:suiteExit = 1
 }
 
 # ---------------------------------------------------------------------------
@@ -622,27 +633,185 @@ function Invoke-IntegrationSuite {
     $script:suiteExit = 0
 }
 
-$failedSuites = $false
-if ($runUnit) {
-    Invoke-UnitSuite
-    if ($script:suiteExit -ne 0) {
-        $failedSuites = $true
-    }
+# ---------------------------------------------------------------------------
+# Concurrent-run guard: one runner per repository.
+#
+# The lock is keyed to the resolved repository path and kept under %TEMP%. A
+# second run that finds a live owner refuses with the owner's pid, start time
+# and suite selection instead of interleaving; a lock whose owner pid is gone is
+# stale and removed.
+# ---------------------------------------------------------------------------
+$repoRoot = Split-Path -Parent $testsDir
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $repoHash = [System.BitConverter]::ToString($sha.ComputeHash(
+            [System.Text.Encoding]::UTF8.GetBytes($repoRoot.ToLowerInvariant()))).Replace('-', '')
+} finally {
+    $sha.Dispose()
 }
-if ($runShell) {
-    Invoke-ShellSuite
-    if ($script:suiteExit -ne 0) {
-        $failedSuites = $true
-    }
-}
-if ($runIntegration) {
-    Invoke-IntegrationSuite
-    if ($script:suiteExit -ne 0) {
-        $failedSuites = $true
+$runLockPath = Join-Path $env:TEMP ('wezterm-session-run-' + $repoHash.Substring(0, 16) + '.lock')
+$selection = @()
+if ($runUnit) { $selection += 'unit' }
+if ($runShell) { $selection += 'shell' }
+if ($runIntegration) { $selection += 'integration' }
+$selectionText = $selection -join '+'
+
+function Read-LockText {
+    param([string]$Path)
+
+    $stream = $null
+    $reader = $null
+    try {
+        # FileShare.ReadWrite lets this read coexist with the owner's open write
+        # handle. The owner keeps FileShare.Read, so no second run can write.
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($stream)
+        return $reader.ReadToEnd()
+    } catch {
+        return $null
+    } finally {
+        if ($null -ne $reader) {
+            $reader.Dispose()
+        } elseif ($null -ne $stream) {
+            $stream.Dispose()
+        }
     }
 }
 
-if ($failedSuites) {
+function Acquire-RunLock {
+    param([string]$Path, [string]$Repo, [string]$Suites)
+
+    for ($attempt = 0; $attempt -lt 4; $attempt++) {
+        if (Test-Path -LiteralPath $Path) {
+            $existingText = Read-LockText -Path $Path
+            if ($null -eq $existingText) {
+                return [pscustomobject]@{
+                    Stream = $null
+                    Message = "run lock $Path exists but cannot be read; another run may be starting. Delete it if it is stale."
+                }
+            }
+            $existing = $existingText | ConvertFrom-Json
+            $otherPid = 0
+            $parsed = [int]::TryParse([string]$existing.pid, [ref]$otherPid)
+            $alive = $false
+            if ($parsed) {
+                $other = Get-Process -Id $otherPid -ErrorAction SilentlyContinue
+                if ($null -ne $other -and @('pwsh', 'powershell') -contains $other.ProcessName) {
+                    $alive = $true
+                }
+            }
+            if ($alive) {
+                return [pscustomobject]@{
+                    Stream = $null
+                    Message = ("another test run is active (pid {0}, started {1}, suites {2}); refusing to interleave" -f `
+                            $otherPid, [string]$existing.started_at, [string]$existing.suites)
+                }
+            }
+
+            # Re-read immediately before removing, so a lock another run just
+            # created is not deleted on the strength of an older read.
+            $again = $null
+            $againText = Read-LockText -Path $Path
+            if ($null -ne $againText) {
+                try {
+                    $again = $againText | ConvertFrom-Json
+                } catch {
+                    $again = $null
+                }
+            }
+            if ($null -ne $again -and [string]$again.pid -ne [string]$existing.pid) {
+                continue
+            }
+            Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        }
+
+        $stream = $null
+        try {
+            # FileShare.Read lets a second run read the owner's metadata so it
+            # can name the active run in its refusal. CreateNew still guarantees
+            # only one creator, and holding the handle keeps the lock alive.
+            $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        } catch {
+            Start-Sleep -Milliseconds 100
+            continue
+        }
+
+        $info = [pscustomobject]@{
+            pid = $PID
+            started_at = (Get-Date).ToString('o')
+            repo = $Repo
+            suites = $Suites
+        }
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes(($info | ConvertTo-Json -Compress))
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush()
+        return [pscustomobject]@{ Stream = $stream; Message = $null; Info = $info }
+    }
+
+    return [pscustomobject]@{
+        Stream = $null
+        Message = "could not acquire the run lock at $Path after several attempts"
+    }
+}
+
+function Release-RunLock {
+    param([string]$Path, $Stream)
+
+    if ($null -ne $Stream) {
+        $Stream.Dispose()
+    }
+    $info = $null
+    $text = Read-LockText -Path $Path
+    if ($null -ne $text) {
+        try {
+            $info = $text | ConvertFrom-Json
+        } catch {
+            $info = $null
+        }
+    }
+    if ($null -eq $info) {
+        return
+    }
+    $ownerPid = 0
+    if ([int]::TryParse([string]$info.pid, [ref]$ownerPid) -and $ownerPid -eq $PID) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$lock = Acquire-RunLock -Path $runLockPath -Repo $repoRoot -Suites $selectionText
+if ($null -eq $lock.Stream) {
+    Write-Output ('FAIL proof: ' + $lock.Message)
     exit 1
 }
-exit 0
+$script:runLock = $lock
+
+try {
+    $failedSuites = $false
+    if ($runUnit) {
+        Invoke-UnitSuite
+        if ($script:suiteExit -ne 0) {
+            $failedSuites = $true
+        }
+    }
+    if ($runShell) {
+        Invoke-ShellSuite
+        if ($script:suiteExit -ne 0) {
+            $failedSuites = $true
+        }
+    }
+    if ($runIntegration) {
+        Invoke-IntegrationSuite
+        if ($script:suiteExit -ne 0) {
+            $failedSuites = $true
+        }
+    }
+
+    if ($failedSuites) {
+        exit 1
+    }
+    exit 0
+} finally {
+    Release-RunLock -Path $runLockPath -Stream $script:runLock.Stream
+}

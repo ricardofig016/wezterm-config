@@ -5,9 +5,12 @@
 --   wezterm.exe --config-file tests\harness\unit.lua show-keys --lua
 --
 -- show-keys needs no window and exits 0 even when this config fails, so the
--- JSON report at tests\.report.json is the only pass signal. This file
--- discovers tests\unit\*_spec.lua, runs every spec, writes the report, and
--- returns a minimal config so the show-keys invocation itself succeeds.
+-- JSON report is the only pass signal. The runner passes a fresh report path
+-- through WEZTERM_SESSION_UNIT_REPORT for every invocation, so two concurrent
+-- runs cannot read each other's verdict and the repository accumulates no
+-- report files. This file discovers tests\unit\*_spec.lua, runs every spec,
+-- writes the report there, and returns a minimal config so the show-keys
+-- invocation itself succeeds.
 --
 -- It deliberately requires no lib module, so it works before the library
 -- exists.
@@ -25,7 +28,10 @@ end
 local harness_dir = normalize(wezterm.config_dir or "")
 local tests_dir = dirname(harness_dir)
 local repo_root = dirname(tests_dir)
-local report_path = tests_dir .. "/.report.json"
+local report_path = os.getenv("WEZTERM_SESSION_UNIT_REPORT")
+if report_path == nil or report_path == "" then
+    error("WEZTERM_SESSION_UNIT_REPORT is not set; run the suite through tests/run.ps1", 0)
+end
 local unit_glob = tests_dir .. "/unit/*_spec.lua"
 local selftest_path = harness_dir .. "/selftest_spec.lua"
 
