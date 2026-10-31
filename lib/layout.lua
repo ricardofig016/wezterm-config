@@ -402,6 +402,9 @@ local MIN_SELFCHECK_SETTLE_MS = 100
 local MAX_SELFCHECK_SETTLE_MS = 60000
 local SELFCHECK_STEP_MS = 100
 local SELFCHECK_SETTLE_SECONDS = 0.1
+-- Pruning parses every session file; run it once, shortly after startup, so it
+-- never sits on the path to a usable window.
+local PRUNE_DELAY_SECONDS = 1
 
 local function selfcheck_settle_steps()
     local ok, raw = pcall(os.getenv, "WEZTERM_SESSION_SELFCHECK_SETTLE_MS")
@@ -837,12 +840,18 @@ function M.on_gui_startup(cmd)
     end
 
     -- Stale instance files otherwise accumulate forever. Prune once per
-    -- startup, after the restore attempt, and never let it break startup.
-    local pruned_ok, pruned = pcall(state.prune, os.time())
-    if pruned_ok then
-        log.info("restore.pruned", { removed = tonumber(pruned) or 0 })
-    else
-        log.warn("restore.prune_failed", { error = tostring(pruned) })
+    -- startup, after the restore attempt, but off the startup path: parsing
+    -- every session file synchronously would delay the first usable window.
+    local scheduled = pcall(wezterm.time.call_after, PRUNE_DELAY_SECONDS, function()
+        local pruned_ok, pruned = pcall(state.prune, os.time())
+        if pruned_ok then
+            log.info("restore.pruned", { removed = tonumber(pruned) or 0 })
+        else
+            log.warn("restore.prune_failed", { error = tostring(pruned) })
+        end
+    end)
+    if not scheduled then
+        log.warn("restore.prune_failed", { error = "could not schedule prune" })
     end
     return true
 end

@@ -1639,4 +1639,34 @@ return {
             end)
         end,
     },
+    {
+        name = "startup defers pruning until the timer fires",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                local queued = {}
+                wezterm.time.call_after = function(_, callback)
+                    queued[#queued + 1] = callback
+                end
+                local prune_calls = 0
+                with_stub(state, "prune", function()
+                    prune_calls = prune_calls + 1
+                    return 2
+                end, function()
+                    with_stub(state, "read_latest", function()
+                        return nil
+                    end, function()
+                        t.eq(layout.on_gui_startup(nil), true)
+                    end)
+                    t.eq(prune_calls, 0, "startup must not prune synchronously")
+                    for _, callback in ipairs(queued) do
+                        callback()
+                    end
+                    t.eq(prune_calls, 1, "the deferred prune must run exactly once")
+                    local pruned = find_event(events, "restore.pruned")
+                    t.ok(pruned ~= nil)
+                    t.eq(pruned.fields.removed, 2)
+                end)
+            end)
+        end,
+    },
 }
