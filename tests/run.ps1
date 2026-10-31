@@ -7,7 +7,10 @@ param(
     # Real-GUI integration suite against wezterm-gui.exe.
     [switch]$Integration,
     # Unit plus shell plus integration.
-    [switch]$All
+    [switch]$All,
+    # Parallel integration scenarios. Each one already owns an isolated state
+    # directory, so the pool is safe; pid ownership is per launch.
+    [int]$Jobs = 4
 )
 
 # An explicit switch selects the suites for that invocation, so -Unit,
@@ -45,6 +48,17 @@ if (-not $runUnit -and -not $runShell -and -not $runIntegration) {
     exit 1
 }
 
+if ($Jobs -lt 1) {
+    $Jobs = 1
+} elseif ($Jobs -gt 16) {
+    $Jobs = 16
+}
+
+# Child runner processes are part of one logical run: they never take the lock
+# and never spawn another pool of suites.
+$isRunnerChild = $env:WEZTERM_SESSION_RUNNER_CHILD -eq '1'
+$script:runTimer = [System.Diagnostics.Stopwatch]::StartNew()
+
 $script:suiteExit = 1
 $script:scenarioPassed = $false
 
@@ -68,6 +82,7 @@ function Invoke-UnitSuite {
     New-Item -ItemType Directory -Path $unitReportDir -Force | Out-Null
     $report = Join-Path $unitReportDir '.report.json'
     $savedReport = $env:WEZTERM_SESSION_UNIT_REPORT
+    $unitTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
     try {
         if (Test-Path -LiteralPath $report) {
@@ -125,6 +140,8 @@ function Invoke-UnitSuite {
     } finally {
         $env:WEZTERM_SESSION_UNIT_REPORT = $savedReport
         Remove-Item -LiteralPath $unitReportDir -Recurse -Force -ErrorAction SilentlyContinue
+        $unitTimer.Stop()
+        Write-Output ("TIME unit: {0:N1}s" -f $unitTimer.Elapsed.TotalSeconds)
     }
 }
 
@@ -133,9 +150,12 @@ function Invoke-UnitSuite {
 # ---------------------------------------------------------------------------
 function Invoke-ShellSuite {
     $script:suiteExit = 1
+    $shellTimer = [System.Diagnostics.Stopwatch]::StartNew()
     $shellRunner = Join-Path $testsDir 'shell\run.ps1'
     if (-not (Test-Path -LiteralPath $shellRunner -PathType Leaf)) {
         Write-Output "FAIL shell: tests\shell\run.ps1 not found at $shellRunner"
+        $shellTimer.Stop()
+        Write-Output ("TIME shell: {0:N1}s" -f $shellTimer.Elapsed.TotalSeconds)
         return
     }
 
@@ -146,6 +166,8 @@ function Invoke-ShellSuite {
         $code = $LASTEXITCODE
     } catch {
         Write-Output "FAIL shell: could not run $shellRunner : $($_.Exception.Message)"
+        $shellTimer.Stop()
+        Write-Output ("TIME shell: {0:N1}s" -f $shellTimer.Elapsed.TotalSeconds)
         return
     }
 
@@ -164,18 +186,16 @@ function Invoke-ShellSuite {
         }
     }
     $script:suiteExit = if ($code -eq 0) { 0 } else { 1 }
+    $shellTimer.Stop()
+    Write-Output ("TIME shell: {0:N1}s" -f $shellTimer.Elapsed.TotalSeconds)
 }
 
 # ---------------------------------------------------------------------------
 # Integration suite: real GUI, isolated state, in-app JSON report.
 # ---------------------------------------------------------------------------
-function Get-WeztermGuiPids {
-    @(Get-Process -Name 'wezterm-gui' -ErrorAction SilentlyContinue |
-        Select-Object -ExpandProperty Id)
-}
-
 # Every process descending from the launched GUI, so a child wezterm-gui pid can
-# be attributed to this run instead of being mistaken for the user's window.
+# be attributed to this launch instead of being mistaken for another scenario's
+# window.
 function Get-WeztermGuiDescendants {
     param([int]$RootPid)
 
@@ -209,47 +229,31 @@ function Get-WeztermGuiDescendants {
     return , $descendants.ToArray()
 }
 
-# Record the wezterm-gui pids before the launch, then report which new pids are
-# owned by this launch: the started pid itself plus its descendants. A new pid
-# that is neither (for example the user opening a terminal during the run) is
-# left alone and never killed.
-function Get-CreatedGuiPids {
-    param(
-        [int[]]$Before,
-        [int]$StartedPid
-    )
+# Owning a pid is per launch: the started wezterm-gui plus its live
+# wezterm-gui descendants. There is deliberately no before/after snapshot, so
+# two scenarios running in parallel can never claim each other's processes.
+function Get-OwnedGuiPids {
+    param([int]$StartedPid)
 
-    $after = @(Get-WeztermGuiPids)
-    $new = @($after | Where-Object { $Before -notcontains $_ })
-    $startedAlive = $null -ne (Get-Process -Id $StartedPid -ErrorAction SilentlyContinue)
-    $descendants = @()
-    if ($startedAlive) {
-        $descendants = @(Get-WeztermGuiDescendants -RootPid $StartedPid)
+    $owned = @()
+    if ($null -eq (Get-Process -Id $StartedPid -ErrorAction SilentlyContinue)) {
+        return $owned
     }
-    $owned = @($new | Where-Object { $_ -eq $StartedPid -or $descendants -contains $_ })
-    if ($startedAlive -and $owned -notcontains $StartedPid) {
-        $owned = @($owned + $StartedPid)
+    $owned += $StartedPid
+    foreach ($descendant in @(Get-WeztermGuiDescendants -RootPid $StartedPid)) {
+        $process = Get-Process -Id $descendant -ErrorAction SilentlyContinue
+        if ($null -ne $process -and $process.ProcessName -eq 'wezterm-gui') {
+            $owned += $descendant
+        }
     }
-
-    [pscustomobject]@{
-        New = $new
-        Owned = $owned
-        StartedAlive = $startedAlive
-    }
+    return @($owned | Sort-Object -Unique)
 }
 
-# Kill only by exact pid, only pids absent from the before snapshot. Returns any
-# owned pid that is still alive afterwards, which the caller reports as stray.
+# Kill only the exact pids this launch owns, then confirm they are gone.
 function Stop-OwnedGuiProcesses {
-    param(
-        [int[]]$Pids,
-        [int[]]$Preexisting
-    )
+    param([int[]]$Pids)
 
     foreach ($processId in $Pids) {
-        if ($Preexisting -contains $processId) {
-            continue
-        }
         if ($null -eq (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
             continue
         }
@@ -272,9 +276,6 @@ function Stop-OwnedGuiProcesses {
 
     if ($alive.Count -gt 0) {
         foreach ($processId in $alive) {
-            if ($Preexisting -contains $processId) {
-                continue
-            }
             try {
                 Stop-Process -Id $processId -Force -ErrorAction Stop
             } catch {
@@ -421,7 +422,6 @@ function Invoke-IntegrationScenario {
     New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
 
     $token = [guid]::NewGuid().ToString('N')
-    $before = @(Get-WeztermGuiPids)
     $started = $null
     $owned = @()
     $reportOutcome = $null
@@ -482,45 +482,48 @@ function Invoke-IntegrationScenario {
                 }
             }
 
-            # Snapshot while the GUI may still be alive so extra gui pids can be
-            # attributed to this launch before anything is killed.
-            $created = Get-CreatedGuiPids -Before $before -StartedPid $started.Id
-            $owned = @($created.Owned)
+            # Ownership is computed from the started pid and its descendants
+            # while the launch is still alive. A .owned-pids declaration is
+            # accepted only for a pid already in that set, so a scenario can
+            # never make this launch kill another scenario's process.
+            $owned = @(Get-OwnedGuiPids -StartedPid $started.Id)
+            $startedAlive = $null -ne (Get-Process -Id $started.Id -ErrorAction SilentlyContinue)
 
-            # A scenario may launch a peer wezterm-gui of its own (the
-            # two-instance scenario does). It records the pids in
-            # <scenario>\.owned-pids, and the runner accepts only pids that are
-            # new GUI processes since the before snapshot, so a scenario can
-            # never make this run kill a process it did not start.
             $ownedPidsPath = Join-Path $scenarioDir '.owned-pids'
             if (Test-Path -LiteralPath $ownedPidsPath) {
                 foreach ($raw in @(Get-Content -LiteralPath $ownedPidsPath -ErrorAction SilentlyContinue)) {
                     $declaredPid = 0
                     if ([int]::TryParse(([string]$raw).Trim(), [ref]$declaredPid)) {
-                        if ($declaredPid -gt 0 -and $created.New -contains $declaredPid -and $owned -notcontains $declaredPid) {
-                            $owned = @($owned + $declaredPid)
+                        if ($declaredPid -gt 0 -and $owned -notcontains $declaredPid) {
+                            # A scenario that already killed its peer leaves a
+                            # dead pid here; that is fine. A live pid that is
+                            # not a descendant is not this launch's to kill.
+                            if ($null -ne (Get-Process -Id $declaredPid -ErrorAction SilentlyContinue)) {
+                                $failureReason = Join-FailureReason $failureReason (
+                                    "scenario declared pid $declaredPid, but it is not a descendant of this launch")
+                            }
                         }
                     }
                 }
             }
 
-            if (-not $created.StartedAlive -and $null -eq $failureReason) {
+            if (-not $startedAlive -and $null -eq $failureReason) {
                 $failureReason = "process $($started.Id) exited before the runner killed it"
             }
 
-            $stopped = Stop-OwnedGuiProcesses -Pids $owned -Preexisting $before
+            $stopped = Stop-OwnedGuiProcesses -Pids $owned
             $aliveAfter = @($stopped.Alive)
             if ($aliveAfter.Count -gt 0) {
                 $failureReason = Join-FailureReason $failureReason 'left stray process(es) after kill: ' + ($aliveAfter -join ',')
             }
-            $processOk = $created.StartedAlive -and $aliveAfter.Count -eq 0
+            $processOk = $startedAlive -and $aliveAfter.Count -eq 0
         }
     } finally {
         # A crash between launch and the normal kill must not leave a GUI behind.
         if ($null -ne $started -and -not $processOk) {
-            $createdNow = Get-CreatedGuiPids -Before $before -StartedPid $started.Id
-            if (@($createdNow.Owned).Count -gt 0) {
-                $null = Stop-OwnedGuiProcesses -Pids @($createdNow.Owned) -Preexisting $before
+            $ownedNow = @(Get-OwnedGuiPids -StartedPid $started.Id)
+            if ($ownedNow.Count -gt 0) {
+                $null = Stop-OwnedGuiProcesses -Pids $ownedNow
             }
         }
         $env:WEZTERM_SESSION_STATE_DIR = $savedState
@@ -582,6 +585,14 @@ function Invoke-IntegrationScenario {
 
 function Invoke-IntegrationSuite {
     $script:suiteExit = 1
+    $suiteTimer = [System.Diagnostics.Stopwatch]::StartNew()
+
+    # -All passes -Jobs to this child through the environment.
+    $requestedJobs = 0
+    if ([int]::TryParse([string]$env:WEZTERM_SESSION_RUNNER_JOBS, [ref]$requestedJobs) `
+            -and $requestedJobs -ge 1) {
+        $Jobs = [Math]::Min($requestedJobs, 16)
+    }
 
     $guiPath = 'C:\Program Files\WezTerm\wezterm-gui.exe'
     if (-not (Test-Path -LiteralPath $guiPath -PathType Leaf)) {
@@ -602,34 +613,134 @@ function Invoke-IntegrationSuite {
         return
     }
 
+    # Child mode: one scenario, launched by the parallel parent.
+    $childScenario = $env:WEZTERM_SESSION_RUNNER_SCENARIO
+    if (-not [string]::IsNullOrEmpty($childScenario)) {
+        $runRoot = $env:WEZTERM_SESSION_RUNNER_RUNROOT
+        if ([string]::IsNullOrEmpty($runRoot)) {
+            $runRoot = Split-Path -Parent $childScenario
+        }
+        $name = [System.IO.Path]::GetFileNameWithoutExtension($childScenario)
+        Invoke-IntegrationScenario -Name $name -ScenarioFile $childScenario `
+            -RunRoot $runRoot -TimeoutSeconds 40 -GuiPath $guiPath
+        $script:suiteExit = if ($script:scenarioPassed) { 0 } else { 1 }
+        return
+    }
+
     $runRoot = Join-Path $env:TEMP ('wezterm-session-layer-it-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
 
-    # Long enough for the save-timing scenario's expected baseline write, ten
-    # seconds of idle silence and a split save, with headroom for a slow shell.
-    $timeoutSeconds = 40
+    # Test-only timing knobs. The production defaults stay covered by the unit
+    # suites; the scenario children and their GUI processes inherit these.
+    $timing = [ordered]@{
+        WEZTERM_SESSION_SELFCHECK_SETTLE_MS = '2500'
+        WEZTERM_SESSION_SAVE_DEBOUNCE_MS    = '400'
+        WEZTERM_SESSION_SAVE_TICK_MS        = '150'
+    }
+    $savedTiming = @{}
+    foreach ($key in $timing.Keys) {
+        $savedTiming[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
+        [Environment]::SetEnvironmentVariable($key, $timing[$key], 'Process')
+    }
+    $savedChild = $env:WEZTERM_SESSION_RUNNER_CHILD
+    $savedScenario = $env:WEZTERM_SESSION_RUNNER_SCENARIO
+    $savedRunRoot = $env:WEZTERM_SESSION_RUNNER_RUNROOT
+    $savedChildJobs = $env:WEZTERM_SESSION_RUNNER_JOBS
+
+    $pwshPath = (Get-Process -Id $PID).Path
+    $pending = New-Object System.Collections.Generic.Queue[object]
+    foreach ($file in $scenarioFiles) {
+        $pending.Enqueue($file)
+    }
+    $running = @()
     $failed = 0
+    $failedNames = @()
+
     try {
-        foreach ($scenarioFile in $scenarioFiles) {
-            $name = [System.IO.Path]::GetFileNameWithoutExtension($scenarioFile.Name)
-            Invoke-IntegrationScenario -Name $name -ScenarioFile $scenarioFile.FullName `
-                -RunRoot $runRoot -TimeoutSeconds $timeoutSeconds -GuiPath $guiPath
-            if (-not $script:scenarioPassed) {
-                $failed++
+        while ($pending.Count -gt 0 -or $running.Count -gt 0) {
+            while ($running.Count -lt $Jobs -and $pending.Count -gt 0) {
+                $file = $pending.Dequeue()
+                $name = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+                $outPath = Join-Path $runRoot ("$name.stdout.log")
+                $errPath = Join-Path $runRoot ("$name.stderr.log")
+
+                $env:WEZTERM_SESSION_RUNNER_CHILD = '1'
+                $env:WEZTERM_SESSION_RUNNER_SCENARIO = $file.FullName
+                $env:WEZTERM_SESSION_RUNNER_RUNROOT = $runRoot
+                $env:WEZTERM_SESSION_RUNNER_JOBS = [string]$Jobs
+
+                try {
+                    $process = Start-Process -FilePath $pwshPath `
+                        -ArgumentList @('-NoProfile', '-File', $PSCommandPath, '-Integration') `
+                        -PassThru `
+                        -RedirectStandardOutput $outPath `
+                        -RedirectStandardError $errPath
+                    $running += [pscustomobject]@{
+                        Process = $process
+                        Name = $name
+                        Out = $outPath
+                        Err = $errPath
+                        Timer = [System.Diagnostics.Stopwatch]::StartNew()
+                    }
+                } catch {
+                    Write-Output ("FAIL {0}: could not start a scenario runner: {1}" -f `
+                            $name, $_.Exception.Message)
+                    $failed++
+                    $failedNames += $name
+                }
+            }
+
+            $finished = @()
+            while ($finished.Count -eq 0 -and $running.Count -gt 0) {
+                $finished = @($running | Where-Object { $_.Process.HasExited })
+                if ($finished.Count -eq 0) {
+                    Start-Sleep -Milliseconds 150
+                }
+            }
+
+            foreach ($item in $finished) {
+                $item.Timer.Stop()
+                foreach ($line in @(Get-Content -LiteralPath $item.Out -ErrorAction SilentlyContinue)) {
+                    Write-Output ([string]$line)
+                }
+                $errText = Get-Content -LiteralPath $item.Err -Raw -ErrorAction SilentlyContinue
+                if (-not [string]::IsNullOrWhiteSpace($errText)) {
+                    foreach ($line in ($errText -split '\r?\n')) {
+                        if ($line -ne '') {
+                            Write-Output ('  stderr: ' + $line)
+                        }
+                    }
+                }
+                if ($item.Process.ExitCode -ne 0) {
+                    $failed++
+                    $failedNames += $item.Name
+                }
+                Write-Output ("TIME {0}: {1:N1}s" -f $item.Name, $item.Timer.Elapsed.TotalSeconds)
+                $running = @($running | Where-Object { $_.Process.Id -ne $item.Process.Id })
             }
         }
     } finally {
+        foreach ($key in $timing.Keys) {
+            [Environment]::SetEnvironmentVariable($key, $savedTiming[$key], 'Process')
+        }
+        $env:WEZTERM_SESSION_RUNNER_CHILD = $savedChild
+        $env:WEZTERM_SESSION_RUNNER_SCENARIO = $savedScenario
+        $env:WEZTERM_SESSION_RUNNER_RUNROOT = $savedRunRoot
+        $env:WEZTERM_SESSION_RUNNER_JOBS = $savedChildJobs
         if ($failed -eq 0 -and (Test-Path -LiteralPath $runRoot)) {
             Remove-Item -LiteralPath $runRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
+    $suiteTimer.Stop()
     if ($failed -gt 0) {
-        Write-Output ("FAIL integration: {0} of {1} scenario(s) failed; artifacts kept at {2}" -f `
-                $failed, $scenarioFiles.Count, $runRoot)
+        Write-Output ("FAIL integration: {0} of {1} scenario(s) failed ({2}); artifacts kept at {3}" -f `
+                $failed, $scenarioFiles.Count, ($failedNames -join ','), $runRoot)
+        Write-Output ("TIME integration: {0:N1}s" -f $suiteTimer.Elapsed.TotalSeconds)
         $script:suiteExit = 1
         return
     }
+    Write-Output ("TIME integration: {0:N1}s" -f $suiteTimer.Elapsed.TotalSeconds)
     $script:suiteExit = 0
 }
 
@@ -780,14 +891,97 @@ function Release-RunLock {
     }
 }
 
-$lock = Acquire-RunLock -Path $runLockPath -Repo $repoRoot -Suites $selectionText
-if ($null -eq $lock.Stream) {
-    Write-Output ('FAIL proof: ' + $lock.Message)
-    exit 1
+# -All starts the three suites as child runners and waits for all of them, so
+# the long integration half hides the unit and shell halves instead of adding
+# to them. Children never take the run lock.
+function Invoke-AllSuites {
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $pwshPath = (Get-Process -Id $PID).Path
+    $tempDir = Join-Path $env:TEMP ('wezterm-session-all-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+
+    $savedChild = $env:WEZTERM_SESSION_RUNNER_CHILD
+    $savedJobs = $env:WEZTERM_SESSION_RUNNER_JOBS
+    $env:WEZTERM_SESSION_RUNNER_CHILD = '1'
+    $env:WEZTERM_SESSION_RUNNER_JOBS = [string]$Jobs
+
+    $suites = @(
+        [pscustomobject]@{ Name = 'unit'; Switch = '-Unit' },
+        [pscustomobject]@{ Name = 'shell'; Switch = '-Shell' },
+        [pscustomobject]@{ Name = 'integration'; Switch = '-Integration' }
+    )
+    $runs = @()
+
+    try {
+        foreach ($suite in $suites) {
+            $outPath = Join-Path $tempDir ($suite.Name + '.stdout.log')
+            $errPath = Join-Path $tempDir ($suite.Name + '.stderr.log')
+            $process = Start-Process -FilePath $pwshPath `
+                -ArgumentList @('-NoProfile', '-File', $PSCommandPath, $suite.Switch) `
+                -PassThru `
+                -RedirectStandardOutput $outPath `
+                -RedirectStandardError $errPath
+            $runs += [pscustomobject]@{
+                Name = $suite.Name
+                Process = $process
+                Out = $outPath
+                Err = $errPath
+                Timer = [System.Diagnostics.Stopwatch]::StartNew()
+            }
+        }
+
+        foreach ($run in $runs) {
+            $run.Process.WaitForExit()
+            $run.Timer.Stop()
+        }
+
+        $failed = $false
+        foreach ($run in $runs) {
+            $outText = @(Get-Content -LiteralPath $run.Out -ErrorAction SilentlyContinue)
+            foreach ($line in $outText) {
+                Write-Output ([string]$line)
+            }
+            $errText = Get-Content -LiteralPath $run.Err -Raw -ErrorAction SilentlyContinue
+            if (-not [string]::IsNullOrWhiteSpace($errText)) {
+                foreach ($line in ($errText -split '\r?\n')) {
+                    if ($line -ne '') {
+                        Write-Output ('  stderr: ' + $line)
+                    }
+                }
+            }
+            Write-Output ("TIME {0}: {1:N1}s" -f $run.Name, $run.Timer.Elapsed.TotalSeconds)
+            if ($run.Process.ExitCode -ne 0) {
+                $failed = $true
+            }
+        }
+        $script:allFailed = $failed
+    } finally {
+        $env:WEZTERM_SESSION_RUNNER_CHILD = $savedChild
+        $env:WEZTERM_SESSION_RUNNER_JOBS = $savedJobs
+        Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$lock = $null
+if (-not $isRunnerChild) {
+    $lock = Acquire-RunLock -Path $runLockPath -Repo $repoRoot -Suites $selectionText
+    if ($null -eq $lock.Stream) {
+        Write-Output ('FAIL proof: ' + $lock.Message)
+        exit 1
+    }
 }
 $script:runLock = $lock
 
 try {
+    if ($allBound -and [bool]$All) {
+        $script:allFailed = $false
+        Invoke-AllSuites
+        if ($script:allFailed) {
+            exit 1
+        }
+        exit 0
+    }
+
     $failedSuites = $false
     if ($runUnit) {
         Invoke-UnitSuite
@@ -813,5 +1007,11 @@ try {
     }
     exit 0
 } finally {
-    Release-RunLock -Path $runLockPath -Stream $script:runLock.Stream
+    if ($null -ne $script:runLock) {
+        Release-RunLock -Path $runLockPath -Stream $script:runLock.Stream
+    }
+    $script:runTimer.Stop()
+    if (-not $isRunnerChild) {
+        Write-Output ("TIME total: {0:N1}s" -f $script:runTimer.Elapsed.TotalSeconds)
+    }
 }

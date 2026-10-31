@@ -83,14 +83,15 @@ wezterm.on("gui-startup", function(_cmd)
             end
 
             -- 2. The shell and tab title can settle just after the baseline
-            -- write. Let the fingerprint go quiet before the ten second idle
-            -- measurement, otherwise this would measure startup, not idleness.
+            -- write. Let the fingerprint go quiet before the idle measurement,
+            -- otherwise this would measure startup, not idleness. The runner
+            -- shrinks the debounce to 400ms for scenarios.
             local quiet_rounds = 0
             await_quiet = function()
                 local before = support.read_text(state_path)
-                wezterm.time.call_after(2.0, function()
+                wezterm.time.call_after(1.5, function()
                     local after = support.read_text(state_path)
-                    if after ~= before and quiet_rounds < 3 then
+                    if after ~= before and quiet_rounds < 6 then
                         quiet_rounds = quiet_rounds + 1
                         await_quiet()
                         return
@@ -99,13 +100,14 @@ wezterm.on("gui-startup", function(_cmd)
                 end)
             end
 
-            -- 3. Ten seconds of silence.
+            -- 3. Three seconds of silence is many multiples of the 400ms test
+            -- debounce, so an idle write would still be caught here.
             measure_idle = function(before)
-                wezterm.time.call_after(10.0, function()
+                wezterm.time.call_after(3.0, function()
                     local after = support.read_text(state_path)
-                    add("idle_silent_10s", after ~= nil and after == before,
-                        after == before and "state file unchanged for 10s"
-                            or "state file changed during ten idle seconds")
+                    add("idle_silent_3s", after ~= nil and after == before,
+                        after == before and "state file unchanged for 3s"
+                            or "state file changed during three idle seconds")
                     split_and_measure()
                 end)
             end
@@ -152,7 +154,35 @@ wezterm.on("gui-startup", function(_cmd)
                 wezterm.time.call_after(0.1, await_saved)
             end
 
-            wezterm.time.call_after(0.1, await_baseline)
+            -- Under a parallel suite the shell can start late. Wait for its
+            -- first prompt before treating the fingerprint as settled, so a
+            -- prompt-time cwd or title update is startup, not an idle write.
+            local prompt_polls = 0
+            local function await_prompt()
+                prompt_polls = prompt_polls + 1
+                local current = tab:panes_with_info()
+                local pane = current[1] and current[1].pane or nil
+                local text = nil
+                if pane ~= nil then
+                    local ok, value = pcall(pane.get_lines_as_text, pane, 120)
+                    if ok and type(value) == "string" then
+                        text = value
+                    end
+                end
+                if text ~= nil and text:find("PS ", 1, true) then
+                    add("shell_prompt", true,
+                        string.format("after %.1fs", prompt_polls * 0.1))
+                    await_baseline()
+                    return
+                end
+                if prompt_polls > 200 then
+                    add("shell_prompt", false, "no prompt after 20s")
+                    finish()
+                    return
+                end
+                wezterm.time.call_after(0.1, await_prompt)
+            end
+            wezterm.time.call_after(0.1, await_prompt)
         end, function(message)
             add("layout_settled", false, message)
             finish()

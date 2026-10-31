@@ -219,11 +219,11 @@ wezterm.on("gui-startup", function(_cmd)
                     after_drift()
                     return
                 end
-                -- The fixed self-check waits up to ten seconds for the shells to
-                -- report cwd, so poll past that window before declaring failure.
-                if drift_polls > 160 then
+                -- The runner shrinks the self-check settle window to 2.5s for
+                -- scenarios; eight seconds leaves room for a slow shell.
+                if drift_polls > 80 then
                     add("log_drift", false,
-                        "no selfcheck.drift within 16s (artifacts: "
+                        "no selfcheck.drift within 8s (artifacts: "
                             .. support.scenario_dir(report_path) .. ")")
                     after_drift()
                     return

@@ -21,7 +21,10 @@ local report_path = os.getenv("WEZTERM_SESSION_TEST_REPORT") or ""
 local token = os.getenv("WEZTERM_SESSION_TEST_TOKEN") or ""
 
 local TAB_TITLE = "cold-restore-silent"
-local WAIT_SECONDS = 12.0
+-- The runner shrinks the self-check settle window to 2.5s for scenarios; four
+-- seconds is past that window and past the old two-second window, so the old
+-- false drift would certainly have appeared.
+local WAIT_SECONDS = 4.0
 
 local checks = {}
 local finished = false

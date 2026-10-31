@@ -184,30 +184,47 @@ wezterm.on("gui-startup", function(_cmd)
         add("instances_distinct", main_entry.id ~= peer_entry.id,
             string.format("main=%s peer=%s", main_entry.id, peer_entry.id))
 
-        local main_text = support.read_text(state.path(main_entry.id))
-        local peer_text = support.read_text(state.path(peer_entry.id))
-        local peer_saved_at = peer_entry.snapshot.saved_at
-
-        -- Neither instance may overwrite the other's file while both are idle.
-        wezterm.time.call_after(1.5, function()
-            add("no_overwrite_idle",
-                support.read_text(state.path(main_entry.id)) == main_text
-                    and support.read_text(state.path(peer_entry.id)) == peer_text,
-                "both session files unchanged over 1.5 idle seconds")
-
-            -- Wait until a later wall-clock second so the main instance's next
-            -- save is strictly newer than the peer's, then change the layout.
-            local second_polls = 0
-            local function await_later_second()
-                second_polls = second_polls + 1
-                if os.time() > peer_saved_at or second_polls > 30 then
-                    split_main(main_entry, peer_entry, peer_text, peer_saved_at)
+        -- Wait until both files stop changing. Under a parallel suite the
+        -- shells can settle later than they do on an idle machine, and a late
+        -- settle write is a change, not a cross-instance overwrite.
+        local function observe_idle(rounds)
+            local main_text = support.read_text(state.path(main_entry.id))
+            local peer_text = support.read_text(state.path(peer_entry.id))
+            wezterm.time.call_after(1.0, function()
+                local main_after = support.read_text(state.path(main_entry.id))
+                local peer_after = support.read_text(state.path(peer_entry.id))
+                if (main_after ~= main_text or peer_after ~= peer_text) and rounds < 8 then
+                    observe_idle(rounds + 1)
                     return
                 end
-                wezterm.time.call_after(0.2, await_later_second)
-            end
-            await_later_second()
-        end)
+
+                wezterm.time.call_after(1.5, function()
+                    local main_final = support.read_text(state.path(main_entry.id))
+                    local peer_final = support.read_text(state.path(peer_entry.id))
+                    add("no_overwrite_idle",
+                        main_final == main_after and peer_final == peer_after,
+                        "both session files unchanged over 1.5 idle seconds")
+
+                    local peer_now = state.read(peer_entry.id)
+                    local peer_saved_at = peer_now ~= nil and peer_now.saved_at
+                        or peer_entry.snapshot.saved_at
+
+                    -- Wait until a later wall-clock second so the main
+                    -- instance's next save is strictly newer than the peer's.
+                    local second_polls = 0
+                    local function await_later_second()
+                        second_polls = second_polls + 1
+                        if os.time() > peer_saved_at or second_polls > 30 then
+                            split_main(main_entry, peer_entry, peer_final, peer_saved_at)
+                            return
+                        end
+                        wezterm.time.call_after(0.2, await_later_second)
+                    end
+                    await_later_second()
+                end)
+            end)
+        end
+        observe_idle(0)
     end
 
     split_main = function(main_entry, peer_entry, peer_text, peer_saved_at)
