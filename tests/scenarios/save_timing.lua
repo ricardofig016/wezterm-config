@@ -1,9 +1,10 @@
 -- Step 8b: save timing.
 --
 -- The startup baseline write is expected. After the fingerprint has settled,
--- an idle instance must not write for at least ten seconds, and a split must be
--- written within three seconds. The scenario reads this instance's own file
--- from the isolated state directory; it never looks at the user's real state.
+-- an idle instance must not write for at least three seconds (many multiples of
+-- the runner's 400 ms scenario debounce), and a split must be written within
+-- three seconds. The scenario reads this instance's own file from the isolated
+-- state directory; it never looks at the user's real state.
 local wezterm = require("wezterm")
 
 local config_dir = (wezterm.config_dir or ""):gsub("\\", "/"):gsub("/+$", "")

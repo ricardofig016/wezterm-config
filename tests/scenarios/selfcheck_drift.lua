@@ -147,10 +147,15 @@ wezterm.on("gui-startup", function(_cmd)
                         read_ok and type(status) == "string" and status:find("drift", 1, true) ~= nil,
                         "status=" .. tostring(status))
                 else
-                    -- This build exposes no status getter. Setting the status is
-                    -- proven by the absence of selfcheck.status_failed above.
-                    add("drift_status", true,
-                        "no status getter in this build; selfcheck.status_failed absent")
+                    -- No status getter exists in this build, so the status text
+                    -- is unobservable here. Do not record this as evidence: the
+                    -- unit fake in tests\unit\layout_spec.lua asserts the exact
+                    -- " restore drift: N " text. The absent
+                    -- selfcheck.status_failed above only proves the status call
+                    -- did not raise.
+                    add("drift_status_unobservable", true,
+                        "no status getter in this build; status text is unobservable here "
+                            .. "(the unit fake asserts the exact text)")
                 end
 
                 -- Public seam: build the report from the live layout as it was,

@@ -751,6 +751,10 @@ function Invoke-IntegrationSuite {
 # second run that finds a live owner refuses with the owner's pid, start time
 # and suite selection instead of interleaving; a lock whose owner pid is gone is
 # stale and removed.
+#
+# The damaged-lock branches (empty or truncated JSON, live or dead owner) are
+# verified manually with hand-written lock files. There is no automated test for
+# them; do not assume coverage from the unit or integration suites.
 # ---------------------------------------------------------------------------
 $repoRoot = Split-Path -Parent $testsDir
 $sha = [System.Security.Cryptography.SHA256]::Create()
