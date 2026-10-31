@@ -1,11 +1,16 @@
--- Step 3 unit tests: the pure geometry planner plus replay logic that can run
--- without a live pane.
+-- Step 3 and step 4 unit tests: the pure geometry planner, replay logic that
+-- can run without a live pane, and restore's decision logic against a fake mux.
 --
 -- Replay's direct proof needs real panes (pane:split), so that belongs to the
 -- integration suite. Here replay is driven by a fake pane that records the
 -- split arguments, which pins the call shape, the cwd, the history key and the
--- returned expected rectangles. plan is covered exhaustively.
+-- returned expected rectangles. plan is covered exhaustively. restore is driven
+-- by a fake mux/window/tab/pane so every fallback path can be observed without
+-- a GUI.
 local layout = require("lib.layout")
+local state = require("lib.state")
+local log = require("lib.log")
+local wezterm = require("wezterm")
 
 local function deep_copy(value)
     if type(value) ~= "table" then
@@ -187,6 +192,205 @@ local three_pane_saved = {
     { id = 12, rect = right_bottom, cwd = "C:\\c" },
 }
 
+-- A fake mux, window, tab and pane set for restore. It records what restore
+-- spawns and splits, and fakes the one asynchronous interaction restore needs.
+local function new_fake_env(options)
+    options = options or {}
+    local pane_config = options.pane_options or {}
+
+    local env = {
+        spawn = nil,
+        spawned_tabs = {},
+        tabs = {},
+        panes = {},
+        windows = {},
+    }
+
+    local function make_pane(pane_options)
+        pane_options = pane_options or pane_config
+        local pane = {
+            ready_at = pane_options.ready_at,
+            info_calls = 0,
+            texts = {},
+            activations = 0,
+            splits = {},
+        }
+        function pane:split(args)
+            if pane_options.split_raises then
+                error("split refused")
+            end
+            local child = make_pane(pane_options)
+            self.splits[#self.splits + 1] = { args = args, child = child }
+            return child
+        end
+        function pane:get_foreground_process_info()
+            self.info_calls = self.info_calls + 1
+            if self.ready_at ~= nil and self.info_calls >= self.ready_at then
+                return { argv = { "ready" } }
+            end
+            return nil
+        end
+        function pane:send_text(text)
+            self.texts[#self.texts + 1] = text
+        end
+        function pane:activate()
+            self.activations = self.activations + 1
+        end
+        return pane
+    end
+
+    local function make_tab()
+        local tab = { titles = {}, activations = 0 }
+        function tab:set_title(title)
+            self.title = title
+            self.titles[#self.titles + 1] = title
+        end
+        function tab:activate()
+            self.activations = self.activations + 1
+        end
+        return tab
+    end
+
+    local function make_window()
+        local window = { maximized = 0, spawn_tab_calls = {} }
+        function window:spawn_tab(args)
+            local tab = make_tab()
+            local pane = make_pane()
+            window.spawn_tab_calls[#window.spawn_tab_calls + 1] = args
+            env.spawned_tabs[#env.spawned_tabs + 1] = { args = args, tab = tab, pane = pane }
+            env.tabs[#env.tabs + 1] = tab
+            env.panes[#env.panes + 1] = pane
+            return tab, pane, window
+        end
+        function window:gui_window()
+            return {
+                maximize = function()
+                    window.maximized = window.maximized + 1
+                end,
+            }
+        end
+        return window
+    end
+
+    env.mux = {
+        spawn_window = function(args)
+            local window = make_window()
+            local tab = make_tab()
+            local pane = make_pane()
+            env.spawn = { args = args, tab = tab, pane = pane, window = window }
+            env.windows[#env.windows + 1] = window
+            env.tabs[#env.tabs + 1] = tab
+            env.panes[#env.panes + 1] = pane
+            return tab, pane, window
+        end,
+        all_windows = function()
+            return env.windows
+        end,
+    }
+
+    return env
+end
+
+local function with_stub(target, name, replacement, fn)
+    local real = target[name]
+    target[name] = replacement
+    local ok, err = pcall(fn)
+    target[name] = real
+    if not ok then
+        error(err, 0)
+    end
+end
+
+-- Run fn(env, events) with a fake mux, immediate timers, a recording logger and
+-- a neutered log.init. Everything is restored afterwards.
+local function with_restore_env(options, fn)
+    local env = new_fake_env(options)
+    local real_mux = wezterm.mux
+    local real_time = wezterm.time
+    local real_log = {
+        init = log.init,
+        debug = log.debug,
+        info = log.info,
+        warn = log.warn,
+        error = log.error,
+    }
+    local events = {}
+
+    log.init = function()
+        env.init_calls = (env.init_calls or 0) + 1
+        return true
+    end
+    for _, level in ipairs({ "debug", "info", "warn", "error" }) do
+        log[level] = function(event, fields)
+            events[#events + 1] = { level = level, event = event, fields = fields }
+            return true
+        end
+    end
+    wezterm.mux = env.mux
+    wezterm.time = {
+        call_after = function(_, callback)
+            callback()
+        end,
+        now = real_time.now,
+    }
+
+    local ok, err = pcall(fn, env, events)
+
+    wezterm.mux = real_mux
+    wezterm.time = real_time
+    log.init = real_log.init
+    log.debug = real_log.debug
+    log.info = real_log.info
+    log.warn = real_log.warn
+    log.error = real_log.error
+
+    if not ok then
+        error(err, 0)
+    end
+end
+
+local function find_event(events, name)
+    for _, event in ipairs(events) do
+        if event.event == name then
+            return event
+        end
+    end
+    return nil
+end
+
+-- A fresh, valid state for restore. Tests override only the pieces they care
+-- about. Tabs and panes are the same shapes state.write serialises.
+local function sample_restore_state(overrides)
+    local now = os.time()
+    local base = {
+        version = state.SCHEMA_VERSION,
+        saved_at = now,
+        instance = { id = "1700000000-00aa01", started_at = now - 10 },
+        window = { cols = 200, rows = 50, active_tab = 2, active_pane = 21 },
+        tabs = {
+            {
+                title = "editor",
+                panes = {
+                    { id = 10, rect = { left = 0, top = 0, width = 100, height = 50 }, cwd = "C:\\a" },
+                    { id = 11, rect = { left = 100, top = 0, width = 100, height = 25 }, cwd = "C:\\b" },
+                    { id = 12, rect = { left = 100, top = 25, width = 100, height = 25 }, cwd = "C:\\c" },
+                },
+            },
+            {
+                title = "logs",
+                panes = {
+                    { id = 20, rect = { left = 0, top = 0, width = 100, height = 50 }, cwd = "C:\\d" },
+                    { id = 21, rect = { left = 100, top = 0, width = 100, height = 50 }, cwd = "C:\\e" },
+                },
+            },
+        },
+    }
+    for key, value in pairs(overrides or {}) do
+        base[key] = value
+    end
+    return base
+end
+
 return {
     {
         name = "plan round-trips one to eight panes at zero tolerance",
@@ -320,7 +524,7 @@ return {
             local tree = layout.plan(three_pane_rects)
             t.ok(tree ~= nil, "plan returned nil")
 
-            local created, expected = layout.replay(root, tree, three_pane_saved)
+            local created, expected, by_leaf = layout.replay(root, tree, three_pane_saved)
             t.ok(created ~= nil, "replay failed: " .. tostring(expected))
             t.eq(#created, 2)
             t.eq(#calls, 2)
@@ -348,6 +552,9 @@ return {
                 [2] = right_top,
                 [3] = right_bottom,
             })
+            t.ok(by_leaf[1] == root, "the first leaf must be the pane that was passed in")
+            t.ok(by_leaf[2] == created[1])
+            t.ok(by_leaf[3] == created[2])
             t.eq(three_pane_saved[1].cwd, "C:\\a", "replay must not mutate the saved panes")
         end,
     },
@@ -427,6 +634,283 @@ return {
                 { left = 0, top = 20, width = 100, height = 30 },
             })
             t.eq(vertical.direction, "Bottom", "a bottom split is spelled Bottom")
+        end,
+    },
+    {
+        name = "restore spawns saved cell dimensions and rebuilds tabs in order",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                local restored = layout.restore({ args = { "pwsh.exe", "-NoLogo" } }, sample_restore_state())
+                t.eq(restored, true)
+
+                t.ok(env.spawn ~= nil, "spawn_window must be called")
+                t.eq(env.spawn.args.width, 200, "saved cols must be the cell width")
+                t.eq(env.spawn.args.height, 50, "saved rows must be the cell height")
+                t.eq(env.spawn.args.cwd, "C:\\a", "the root pane's saved cwd")
+                t.eq(env.spawn.args.args, { "pwsh.exe", "-NoLogo" }, "the startup command must survive")
+                t.eq(env.spawn.args.set_environment_variables, {
+                    WEZTERM_SESSION_HISTORY_KEY = "10",
+                })
+                t.eq(env.spawn.tab.titles, { "editor" })
+                t.eq(env.spawn.tab.activations, 0, "the inactive tab must not be activated")
+
+                t.eq(#env.spawned_tabs, 1, "the second tab must be spawned in the same window")
+                t.eq(env.spawned_tabs[1].args.cwd, "C:\\d")
+                t.eq(env.spawned_tabs[1].args.set_environment_variables, {
+                    WEZTERM_SESSION_HISTORY_KEY = "20",
+                })
+                t.eq(env.spawned_tabs[1].tab.titles, { "logs" })
+                t.eq(env.spawned_tabs[1].tab.activations, 1, "the saved active tab must be activated")
+
+                local root = env.spawn.pane
+                t.eq(#root.splits, 1)
+                t.eq(root.splits[1].args.direction, "Right")
+                t.eq(root.splits[1].args.size, 100)
+                t.eq(root.splits[1].args.cwd, "C:\\b")
+                t.eq(root.splits[1].args.set_environment_variables, {
+                    WEZTERM_SESSION_HISTORY_KEY = "11",
+                })
+                local right = root.splits[1].child
+                t.eq(#right.splits, 1)
+                t.eq(right.splits[1].args.direction, "Bottom")
+                t.eq(right.splits[1].args.size, 25)
+                t.eq(right.splits[1].args.cwd, "C:\\c")
+                t.eq(right.splits[1].args.set_environment_variables, {
+                    WEZTERM_SESSION_HISTORY_KEY = "12",
+                })
+
+                local tab2_root = env.spawned_tabs[1].pane
+                t.eq(#tab2_root.splits, 1)
+                t.eq(tab2_root.splits[1].args.cwd, "C:\\e")
+                t.eq(tab2_root.splits[1].args.set_environment_variables, {
+                    WEZTERM_SESSION_HISTORY_KEY = "21",
+                })
+                t.eq(tab2_root.splits[1].child.activations, 1, "the saved active pane must be activated")
+                t.eq(root.activations, 0, "non-active panes must not be activated")
+
+                t.ok(find_event(events, "restore.start") ~= nil)
+                t.ok(find_event(events, "restore.done") ~= nil)
+            end)
+        end,
+    },
+    {
+        name = "restore without a state logs and opens one maximized window",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                local restored = layout.restore({ args = { "pwsh.exe" } }, nil)
+                t.eq(restored, false)
+                t.ok(env.spawn ~= nil, "the fallback must spawn a window")
+                t.eq(env.spawn.args.args, { "pwsh.exe" })
+                t.eq(env.spawn.args.width, nil, "the fallback must not reuse saved cells")
+                t.eq(env.spawn.args.height, nil)
+                t.eq(env.spawn.window.maximized, 1)
+                t.eq(#env.spawned_tabs, 0)
+                t.ok(find_event(events, "restore.no_state") ~= nil)
+            end)
+        end,
+    },
+    {
+        name = "restore rejects a stale state",
+        run = function(t)
+            local stale = sample_restore_state({ saved_at = os.time() - state.MAX_AGE_SECONDS - 10 })
+            with_restore_env({}, function(env, events)
+                t.eq(layout.restore(nil, stale), false)
+                t.eq(env.spawn.args.width, nil)
+                t.eq(env.spawn.window.maximized, 1)
+                t.ok(find_event(events, "restore.stale") ~= nil)
+            end)
+        end,
+    },
+    {
+        name = "restore rejects a mismatched schema version",
+        run = function(t)
+            local future = sample_restore_state({ version = 2 })
+            with_restore_env({}, function(env, events)
+                t.eq(layout.restore(nil, future), false)
+                local event = find_event(events, "restore.version")
+                t.ok(event ~= nil)
+                t.eq(event.fields.found, "2")
+                t.eq(event.fields.expected, state.SCHEMA_VERSION)
+                t.eq(env.spawn.args.width, nil)
+            end)
+        end,
+    },
+    {
+        name = "restore rejects a state with no tabs",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                t.eq(layout.restore(nil, state.empty()), false)
+                t.ok(find_event(events, "restore.empty") ~= nil)
+                t.ok(env.spawn ~= nil)
+                t.eq(env.spawn.args.width, nil)
+            end)
+        end,
+    },
+    {
+        name = "restore falls back when the plan refuses the rectangles",
+        run = function(t)
+            local overlapped = sample_restore_state({
+                window = { cols = 110, rows = 50, active_tab = 1, active_pane = 30 },
+                tabs = {
+                    {
+                        title = "bad",
+                        panes = {
+                            { id = 30, rect = { left = 0, top = 0, width = 60, height = 50 }, cwd = "C:\\x" },
+                            { id = 31, rect = { left = 50, top = 0, width = 60, height = 50 }, cwd = "C:\\y" },
+                        },
+                    },
+                },
+            })
+            with_restore_env({}, function(env, events)
+                t.eq(layout.restore(nil, overlapped), false)
+                t.ok(find_event(events, "restore.plan_failed") ~= nil)
+                t.ok(env.spawn ~= nil)
+                t.eq(env.spawn.args.width, nil, "plan failure must fall back before spawning saved cells")
+                t.eq(env.spawn.window.maximized, 1)
+                t.eq(#env.spawned_tabs, 0)
+            end)
+        end,
+    },
+    {
+        name = "restore logs and keeps a usable window when replay fails",
+        run = function(t)
+            local broken = sample_restore_state({
+                window = { cols = 200, rows = 50, active_tab = 1, active_pane = 20 },
+                tabs = {
+                    {
+                        title = "broken",
+                        panes = {
+                            { id = 20, rect = { left = 0, top = 0, width = 100, height = 50 }, cwd = "C:\\d" },
+                            { id = 21, rect = { left = 100, top = 0, width = 100, height = 50 }, cwd = "C:\\e" },
+                        },
+                    },
+                },
+            })
+            with_restore_env({ pane_options = { split_raises = true } }, function(env, events)
+                t.eq(layout.restore(nil, broken), false)
+                t.eq(#env.windows, 1, "the partially restored window must be kept, not duplicated")
+                t.eq(env.spawn.args.width, 200, "the restored window was already spawned")
+                t.eq(env.spawn.window.maximized, 1, "the kept window must be maximized")
+                t.eq(#env.spawned_tabs, 0)
+                t.ok(find_event(events, "restore.failed") ~= nil)
+            end)
+        end,
+    },
+    {
+        name = "restore replays a full-screen program once the shell answers",
+        run = function(t)
+            local foreground = sample_restore_state({
+                window = { cols = 200, rows = 50, active_tab = 1, active_pane = 10 },
+                tabs = {
+                    {
+                        title = "apps",
+                        panes = {
+                            {
+                                id = 10,
+                                rect = { left = 0, top = 0, width = 100, height = 50 },
+                                cwd = "C:\\a",
+                                foreground = { argv = { "less", "app.log" }, alt_screen = true },
+                            },
+                            {
+                                id = 11,
+                                rect = { left = 100, top = 0, width = 100, height = 50 },
+                                cwd = "C:\\b",
+                                foreground = { argv = { "top" }, alt_screen = false },
+                            },
+                        },
+                    },
+                },
+            })
+            with_restore_env({ pane_options = { ready_at = 2 } }, function(env, events)
+                t.eq(layout.restore(nil, foreground), true)
+                local root = env.spawn.pane
+                local child = root.splits[1].child
+                t.eq(root.info_calls, 2, "the shell query must be polled before the first answer")
+                t.eq(root.texts, { "less app.log\r" })
+                t.eq(child.info_calls, 0, "a non-alt-screen foreground must not be replayed")
+                t.eq(child.texts, {})
+                t.ok(find_event(events, "restore.foreground") ~= nil)
+            end)
+        end,
+    },
+    {
+        name = "restore gives up quietly when a foreground program never answers",
+        run = function(t)
+            local foreground = sample_restore_state({
+                window = { cols = 200, rows = 50, active_tab = 1, active_pane = 10 },
+                tabs = {
+                    {
+                        title = "apps",
+                        panes = {
+                            {
+                                id = 10,
+                                rect = { left = 0, top = 0, width = 200, height = 50 },
+                                cwd = "C:\\a",
+                                foreground = { argv = { "less" }, alt_screen = true },
+                            },
+                        },
+                    },
+                },
+            })
+            with_restore_env({}, function(env, events)
+                t.eq(layout.restore(nil, foreground), true)
+                local root = env.spawn.pane
+                t.eq(root.info_calls, 20, "the foreground wait must be bounded")
+                t.eq(root.texts, {}, "nothing must be typed after the timeout")
+                t.ok(find_event(events, "restore.foreground_timeout") ~= nil)
+                t.eq(find_event(events, "restore.foreground"), nil)
+            end)
+        end,
+    },
+    {
+        name = "on_gui_startup initializes the log and restores the latest state",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                with_stub(state, "read_latest", function()
+                    return sample_restore_state()
+                end, function()
+                    t.eq(layout.on_gui_startup({ args = { "pwsh.exe" } }), true)
+                end)
+                t.eq(env.init_calls, 1, "the handler must initialize the log")
+                t.ok(env.spawn ~= nil)
+                t.eq(env.spawn.args.width, 200)
+                t.ok(find_event(events, "restore.done") ~= nil)
+            end)
+        end,
+    },
+    {
+        name = "on_gui_startup survives a state read failure",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                with_stub(state, "read_latest", function()
+                    error("disk gone")
+                end, function()
+                    t.eq(layout.on_gui_startup(nil), true)
+                end)
+                t.ok(find_event(events, "restore.read_failed") ~= nil)
+                t.ok(find_event(events, "restore.no_state") ~= nil)
+                t.ok(env.spawn ~= nil, "the fallback must still open a window")
+                t.eq(env.spawn.window.maximized, 1)
+            end)
+        end,
+    },
+    {
+        name = "on_gui_startup survives an unexpected restore failure",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                with_stub(state, "read_latest", function()
+                    return sample_restore_state()
+                end, function()
+                    with_stub(state, "is_stale", function()
+                        error("boom")
+                    end, function()
+                        t.eq(layout.on_gui_startup(nil), true)
+                    end)
+                end)
+                t.ok(find_event(events, "restore.failed") ~= nil)
+                t.ok(env.spawn ~= nil, "the fallback must still open a window")
+                t.eq(env.spawn.window.maximized, 1)
+            end)
         end,
     },
 }

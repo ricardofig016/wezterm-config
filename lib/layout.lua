@@ -20,9 +20,27 @@
 -- a different spelling and belongs to lib\keys.lua. Each split passes cwd and
 -- WEZTERM_SESSION_HISTORY_KEY for the pane it creates, which is the first leaf
 -- of that split's second subtree. replay returns the created panes (in creation
--- order) and the expected rectangles keyed by leaf; the pane passed in is the
--- first leaf of the whole tree and its cwd is restore's job.
+-- order), the expected rectangles keyed by leaf, and the pane object that ended
+-- up in each leaf. The pane passed in is the first leaf of the whole tree and
+-- its cwd is restore's job.
+--
+-- restore(cmd, latest) spawns the saved window and rebuilds its tabs from a
+-- state that on_gui_startup already read. It validates the state, plans every
+-- tab before touching the mux, then spawns with saved cell dimensions and
+-- replays each tab. Every rejection or rebuild failure logs a restore. event
+-- and falls back to a maximized window, so a bad state never leaves the user
+-- without a terminal.
+local wezterm = require("wezterm")
+
+local state = require("lib.state")
+local log = require("lib.log")
+
 local M = {}
+
+-- Foreground programs are typed once the pane's shell answers the foreground
+-- process query. Poll a bounded number of times, then give up quietly.
+local FOREGROUND_POLL_ATTEMPTS = 20
+local FOREGROUND_POLL_DELAY = 0.1
 
 local function is_integer(value)
     return type(value) == "number" and value == math.floor(value)
@@ -236,7 +254,7 @@ function M.replay(pane, tree, panes)
 
     local created = {}
     local expected = {}
-
+    local by_leaf = {}
     local seen = {}
 
     local ok, err = pcall(function()
@@ -270,6 +288,7 @@ function M.replay(pane, tree, panes)
                     error("saved pane " .. tostring(index) .. " has no valid rect")
                 end
                 expected[index] = saved.rect
+                by_leaf[index] = target
                 return
             end
 
@@ -317,16 +336,312 @@ function M.replay(pane, tree, panes)
     if not ok then
         return nil, tostring(err)
     end
-    return created, expected
+    return created, expected, by_leaf
 end
 
-function M.restore(window, state)
-    return nil
+local function spawn_args(cmd)
+    local args = {}
+    if type(cmd) == "table" then
+        for key, value in pairs(cmd) do
+            args[key] = value
+        end
+    end
+    return args
+end
+
+local function with_history_env(args, saved_pane)
+    local variables = {}
+    if type(args.set_environment_variables) == "table" then
+        for key, value in pairs(args.set_environment_variables) do
+            variables[key] = value
+        end
+    end
+    variables.WEZTERM_SESSION_HISTORY_KEY = tostring(saved_pane.id)
+    args.set_environment_variables = variables
+    return args
+end
+
+local function maximize(window)
+    if window == nil then
+        return false
+    end
+    return pcall(function()
+        window:gui_window():maximize()
+    end)
+end
+
+local function existing_window()
+    local ok, windows = pcall(wezterm.mux.all_windows)
+    if not ok or windows == nil then
+        return nil
+    end
+    local last
+    for _, window in ipairs(windows) do
+        last = window
+    end
+    return last
+end
+
+-- Fallback: keep exactly one usable window. A partially restored window is
+-- maximized rather than replaced, so a failure never leaves the user with no
+-- terminal or with two windows.
+local function fallback(cmd)
+    local window = existing_window()
+    if window ~= nil then
+        maximize(window)
+        return false
+    end
+
+    local ok, _, _, spawned = pcall(wezterm.mux.spawn_window, spawn_args(cmd))
+    if not ok or spawned == nil then
+        log.error("restore.fallback_failed", { error = tostring(spawned) })
+        return false
+    end
+    maximize(spawned)
+    return false
+end
+
+local function join_argv(argv)
+    local ok, joined = pcall(wezterm.shell_join_args, argv)
+    if ok and type(joined) == "string" and joined ~= "" then
+        return joined
+    end
+    return table.concat(argv, " ")
+end
+
+-- Wait, bounded, for the pane's shell to answer the foreground process query,
+-- then type the saved argv. The pane's shell does not exist during gui-startup,
+-- so this has to be a timer, not an immediate send.
+local function schedule_foreground(pane, argv, pane_id, tab_index)
+    local attempts = 0
+    local function poll()
+        attempts = attempts + 1
+        local info_ok, info = pcall(pane.get_foreground_process_info, pane)
+        if info_ok and info ~= nil then
+            local command = join_argv(argv)
+            local sent = pcall(pane.send_text, pane, command .. "\r")
+            if sent then
+                log.info("restore.foreground", {
+                    tab = tab_index,
+                    pane = pane_id,
+                    command = command,
+                })
+            else
+                log.warn("restore.foreground_failed", { tab = tab_index, pane = pane_id })
+            end
+            return
+        end
+        if attempts >= FOREGROUND_POLL_ATTEMPTS then
+            log.debug("restore.foreground_timeout", { tab = tab_index, pane = pane_id })
+            return
+        end
+        wezterm.time.call_after(FOREGROUND_POLL_DELAY, poll)
+    end
+    wezterm.time.call_after(FOREGROUND_POLL_DELAY, poll)
+end
+
+-- latest is the state on_gui_startup read, or nil when there is none. restore
+-- itself never reads the disk, so the decision logic is testable with a fake
+-- mux. It returns true only when the saved layout was rebuilt.
+function M.restore(cmd, latest)
+    if type(latest) ~= "table" then
+        log.warn("restore.no_state")
+        return fallback(cmd)
+    end
+
+    if latest.version ~= state.SCHEMA_VERSION then
+        log.warn("restore.version", {
+            found = tostring(latest.version),
+            expected = state.SCHEMA_VERSION,
+        })
+        return fallback(cmd)
+    end
+
+    if not state.validate(latest) then
+        log.warn("restore.invalid")
+        return fallback(cmd)
+    end
+
+    if state.is_stale(latest) then
+        log.warn("restore.stale", {
+            saved_at = tostring(latest.saved_at),
+            max_age = state.MAX_AGE_SECONDS,
+        })
+        return fallback(cmd)
+    end
+
+    local tab_count = #latest.tabs
+    if tab_count == 0 then
+        log.warn("restore.empty")
+        return fallback(cmd)
+    end
+
+    if
+        not is_integer(latest.window.cols)
+        or latest.window.cols < 1
+        or not is_integer(latest.window.rows)
+        or latest.window.rows < 1
+    then
+        log.warn("restore.invalid_window", {
+            cols = tostring(latest.window.cols),
+            rows = tostring(latest.window.rows),
+        })
+        return fallback(cmd)
+    end
+
+    -- Plan every tab before touching the mux, so a layout WezTerm cannot
+    -- rebuild falls back without first opening a window.
+    local plans = {}
+    for tab_index, tab in ipairs(latest.tabs) do
+        local rects = {}
+        for _, saved_pane in ipairs(tab.panes) do
+            rects[#rects + 1] = saved_pane.rect
+        end
+        local tree = M.plan(rects)
+        if tree == nil then
+            log.error("restore.plan_failed", { tab = tab_index, panes = #rects })
+            return fallback(cmd)
+        end
+        plans[tab_index] = { saved = tab, tree = tree }
+    end
+
+    local active_tab = latest.window.active_tab
+    if not is_integer(active_tab) or active_tab < 1 or active_tab > tab_count then
+        log.warn("restore.active_tab_missing", { tab = tostring(active_tab) })
+        active_tab = 1
+    end
+
+    local active_leaf
+    for index, saved_pane in ipairs(latest.tabs[active_tab].panes) do
+        if saved_pane.id == latest.window.active_pane then
+            active_leaf = index
+            break
+        end
+    end
+    if active_leaf == nil then
+        log.warn("restore.active_pane_missing", { pane = tostring(latest.window.active_pane) })
+        active_leaf = 1
+    end
+
+    log.info("restore.start", {
+        tabs = tab_count,
+        cols = latest.window.cols,
+        rows = latest.window.rows,
+    })
+
+    local root_saved = latest.tabs[1].panes[first_leaf(plans[1].tree)]
+    local args = spawn_args(cmd)
+    args.width = latest.window.cols
+    args.height = latest.window.rows
+    args.cwd = root_saved.cwd
+    with_history_env(args, root_saved)
+
+    local spawn_ok, spawned_tab, spawned_pane, window = pcall(wezterm.mux.spawn_window, args)
+    if not spawn_ok or window == nil then
+        log.error("restore.spawn_failed", { error = tostring(spawned_tab) })
+        return fallback(cmd)
+    end
+
+    local tab_objects = {}
+    local built, build_err = pcall(function()
+        for tab_index, plan in ipairs(plans) do
+            local tab
+            local pane
+            if tab_index == 1 then
+                tab, pane = spawned_tab, spawned_pane
+            else
+                local tab_root_saved = plan.saved.panes[first_leaf(plan.tree)]
+                local tab_args = { cwd = tab_root_saved.cwd }
+                with_history_env(tab_args, tab_root_saved)
+                local tab_ok, new_tab, new_pane = pcall(window.spawn_tab, window, tab_args)
+                if not tab_ok or new_tab == nil or new_pane == nil then
+                    error("tab " .. tab_index .. " spawn failed: " .. tostring(new_tab))
+                end
+                tab, pane = new_tab, new_pane
+            end
+            tab_objects[tab_index] = tab
+
+            if type(plan.saved.title) == "string" then
+                local titled = pcall(tab.set_title, tab, plan.saved.title)
+                if not titled then
+                    log.warn("restore.title_failed", { tab = tab_index })
+                end
+            end
+
+            local created, expected, by_leaf = M.replay(pane, plan.tree, plan.saved.panes)
+            if created == nil then
+                error("tab " .. tab_index .. " replay failed: " .. tostring(expected))
+            end
+            plan.by_leaf = by_leaf
+        end
+    end)
+
+    if not built then
+        log.error("restore.failed", { error = tostring(build_err) })
+        maximize(window)
+        return false
+    end
+
+    for tab_index, plan in ipairs(plans) do
+        for leaf, saved_pane in ipairs(plan.saved.panes) do
+            local foreground = saved_pane.foreground
+            if
+                foreground ~= nil
+                and foreground.alt_screen == true
+                and type(foreground.argv) == "table"
+                and #foreground.argv > 0
+            then
+                local pane_object = plan.by_leaf[leaf]
+                if pane_object ~= nil then
+                    local scheduled = pcall(
+                        schedule_foreground,
+                        pane_object,
+                        foreground.argv,
+                        saved_pane.id,
+                        tab_index
+                    )
+                    if not scheduled then
+                        log.warn("restore.foreground_failed", {
+                            tab = tab_index,
+                            pane = saved_pane.id,
+                        })
+                    end
+                end
+            end
+        end
+    end
+
+    local active_tab_object = tab_objects[active_tab]
+    if active_tab_object ~= nil then
+        pcall(active_tab_object.activate, active_tab_object)
+    end
+    local active_pane_object = plans[active_tab].by_leaf[active_leaf]
+    if active_pane_object ~= nil then
+        pcall(active_pane_object.activate, active_pane_object)
+    end
+
+    log.info("restore.done", { tabs = tab_count, active_tab = active_tab })
+    return true
 end
 
 -- Registered on gui-startup by the entry. Must return true: a false return
--- silences every gui-startup handler registered after this one.
+-- silences every gui-startup handler registered after this one. The entry
+-- wraps this call already; it also must not depend on that wrapper, so every
+-- internal failure is caught here.
 function M.on_gui_startup(cmd)
+    pcall(log.init)
+
+    local read_ok, latest = pcall(state.read_latest)
+    if not read_ok then
+        log.error("restore.read_failed", { error = tostring(latest) })
+        latest = nil
+    end
+
+    local ok, err = pcall(M.restore, cmd, latest)
+    if not ok then
+        log.error("restore.failed", { error = tostring(err) })
+        fallback(cmd)
+    end
     return true
 end
 
