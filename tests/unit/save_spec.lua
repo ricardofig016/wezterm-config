@@ -6,6 +6,8 @@ local save = require("lib.save")
 local state = require("lib.state")
 local log = require("lib.log")
 
+local real_getenv = os.getenv
+
 local function fake_pane(opts)
     local pane = {
         id = opts.id,
@@ -89,7 +91,95 @@ local function one_tab_window(pane_opts, tab_title)
     })
     return fake_window({
         { index = 0, is_active = true, tab = tab },
-    })
+    }), pane
+end
+
+local function status_window(pane_opts, tab_title)
+    local window, pane = one_tab_window(pane_opts, tab_title)
+    window.status = nil
+    function window:set_right_status(text)
+        self.status = text
+    end
+    function window:is_focused()
+        return true
+    end
+    return window, pane
+end
+
+local temp_counter = 0
+
+local function next_dir(name)
+    temp_counter = temp_counter + 1
+    local base = (os.getenv("TEMP") or "."):gsub("\\", "/")
+    local dir = string.format("%s/wezterm-save-spec-%d-%d-%s", base, os.time(), temp_counter, name)
+    dir = dir:gsub("/", "\\")
+    os.execute('mkdir "' .. dir .. '"')
+    return dir
+end
+
+local function with_state_dir(name, fn)
+    local dir = next_dir(name)
+    os.getenv = function(var)
+        if var == "WEZTERM_SESSION_STATE_DIR" then
+            return dir
+        end
+        return real_getenv(var)
+    end
+    local ok, err = pcall(fn, dir)
+    os.getenv = real_getenv
+    os.execute('rmdir /s /q "' .. dir .. '"')
+    if not ok then
+        error(err, 0)
+    end
+end
+
+local function with_fake_timers(fn)
+    local real_call_after = wezterm.time.call_after
+    local timers = {}
+    wezterm.time.call_after = function(seconds, callback)
+        timers[#timers + 1] = { seconds = seconds, callback = callback }
+        return true
+    end
+    local ok, err = pcall(fn, timers)
+    wezterm.time.call_after = real_call_after
+    if not ok then
+        error(err, 0)
+    end
+end
+
+local function with_captured_logs(fn)
+    local real_error = log.error
+    local real_info = log.info
+    local events = {}
+    log.error = function(event, fields)
+        events[#events + 1] = { level = "error", event = event, fields = fields }
+        return true
+    end
+    log.info = function(event, fields)
+        events[#events + 1] = { level = "info", event = event, fields = fields }
+        return true
+    end
+    local ok, err = pcall(fn, events)
+    log.error = real_error
+    log.info = real_info
+    if not ok then
+        error(err, 0)
+    end
+end
+
+local function with_blocked_state_write(blocked, fn)
+    local real_open = io.open
+    io.open = function(path, mode, ...)
+        if path == blocked and type(mode) == "string" and mode:sub(1, 1) == "w" then
+            return nil
+        end
+        return real_open(path, mode, ...)
+    end
+    local ok, err = pcall(fn)
+    io.open = real_open
+    if not ok then
+        error(err, 0)
+    end
 end
 
 return {
@@ -388,17 +478,11 @@ return {
         name = "start is idempotent and gui-startup always returns true",
         run = function(t)
             local real_call_after = wezterm.time.call_after
-            local real_log_init = log.init
             local scheduled = 0
             wezterm.time.call_after = function(seconds, fn)
                 scheduled = scheduled + 1
                 t.eq(seconds, save.TICK_SECONDS)
                 t.ok(type(fn) == "function", "the timer needs a callback")
-                return true
-            end
-            -- start() initializes the logger; keep that side effect out of the
-            -- state spec that runs later in the same process.
-            log.init = function()
                 return true
             end
 
@@ -408,10 +492,67 @@ return {
                 t.eq(save.start(), true)
             end)
             wezterm.time.call_after = real_call_after
-            log.init = real_log_init
 
             t.ok(ok, err ~= nil and tostring(err) or "startup failed")
             t.eq(scheduled, 1, "the detector must register exactly one tick chain")
+        end,
+    },
+    {
+        name = "a refused write shows save failed, logs it, and a later save replaces the status",
+        run = function(t)
+            with_state_dir("save-failure", function()
+                local window = status_window({ id = 41, cwd = "/C:/work" })
+                local blocked = state.path(state.instance_id()) .. ".tmp"
+
+                with_fake_timers(function(timers)
+                    with_captured_logs(function(events)
+                        with_blocked_state_write(blocked, function()
+                            t.eq(save.save_now(window), false, "a refused write must return false")
+                        end)
+
+                        t.eq(window.status, " save failed ", "the failure must be visible")
+                        t.eq(#timers, 1, "the failure must schedule one clear")
+                        t.eq(
+                            timers[1].seconds,
+                            save.FAILURE_STATUS_SECONDS,
+                            "the failure must last ten seconds, not a flicker"
+                        )
+
+                        t.eq(#events, 1, "the failure must log one event")
+                        t.eq(events[1].level, "error")
+                        t.eq(events[1].event, "save.failed")
+                        t.eq(events[1].fields.trigger, "manual")
+                        t.ok(
+                            type(events[1].fields.reason) == "string" and events[1].fields.reason ~= "",
+                            "the failure must carry a reason"
+                        )
+
+                        t.eq(save.save_now(window), true, "the next save must succeed")
+                        t.ok(
+                            window.status:match("^ saved %d%d:%d%d:%d%d $") ~= nil,
+                            "the timestamp must replace the failure, got " .. tostring(window.status)
+                        )
+                        t.eq(#timers, 2, "the success must schedule its own clear")
+                        t.eq(timers[2].seconds, save.STATUS_SECONDS, "the success status clears after three seconds")
+
+                        timers[1].callback()
+                        t.ok(
+                            window.status:match("^ saved %d%d:%d%d:%d%d $") ~= nil,
+                            "an older failure timer must not clear the successful status"
+                        )
+
+                        timers[2].callback()
+                        t.eq(window.status, "", "the success timer must clear the status")
+
+                        t.eq(#events, 2, "the success must log one event")
+                        t.eq(events[2].level, "info")
+                        t.eq(events[2].event, "save.wrote")
+                        t.eq(events[2].fields.trigger, "manual")
+                        t.eq(events[2].fields.tabs, 1)
+                        t.eq(events[2].fields.panes, 1)
+                    end)
+                end)
+            end)
         end,
     },
     {

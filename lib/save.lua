@@ -14,11 +14,13 @@ local M = {}
 M.TICK_SECONDS = 1
 M.DEBOUNCE_SECONDS = 2
 M.STATUS_SECONDS = 3
+M.FAILURE_STATUS_SECONDS = 10
 
 local started = false
 local started_at
 local last_written
 local pending
+local status_epoch = 0
 
 -- Logging must never break the save path or the reschedule chain.
 local function safe_log(level, event, fields)
@@ -289,6 +291,46 @@ function M.decide(last_written, pending_state, current, now, settle_seconds)
     return false, pending_state
 end
 
+local function set_right_status(window, text)
+    if window == nil then
+        return false
+    end
+    local ok = pcall(function()
+        window:set_right_status(text)
+    end)
+    return ok
+end
+
+-- Only the newest status may clear itself. A successful save therefore cannot
+-- be wiped by an older failure timer, and a failure cannot be swallowed by an
+-- older success timer.
+local function clear_status_later(window, seconds, token)
+    local ok = pcall(wezterm.time.call_after, seconds or M.STATUS_SECONDS, function()
+        if token ~= nil and token ~= status_epoch then
+            return
+        end
+        pcall(function()
+            window:set_right_status("")
+        end)
+    end)
+    return ok
+end
+
+local function show_status(window, text, seconds)
+    if window == nil then
+        return false
+    end
+    status_epoch = status_epoch + 1
+    local token = status_epoch
+    set_right_status(window, text)
+    clear_status_later(window, seconds or M.STATUS_SECONDS, token)
+    return true
+end
+
+local function show_failure(window)
+    return show_status(window, " save failed ", M.FAILURE_STATUS_SECONDS)
+end
+
 local function pane_count(snapshot)
     local count = 0
     for _, tab in ipairs(snapshot.tabs) do
@@ -297,15 +339,17 @@ local function pane_count(snapshot)
     return count
 end
 
-local function write_snapshot(snapshot, trigger)
+local function write_snapshot(snapshot, trigger, window)
     local instance = tostring(snapshot.instance.id)
     local ok, wrote = pcall(state.write, snapshot)
     if not ok then
+        local reason = tostring(wrote)
         safe_log("error", "save.failed", {
             trigger = trigger,
             instance = instance,
-            reason = tostring(wrote),
+            reason = reason,
         })
+        show_failure(window)
         return false
     end
     if not wrote then
@@ -314,6 +358,7 @@ local function write_snapshot(snapshot, trigger)
             instance = instance,
             reason = "state.write refused the snapshot",
         })
+        show_failure(window)
         return false
     end
 
@@ -348,30 +393,6 @@ local function find_window()
     return fallback
 end
 
-local function set_right_status(window, text)
-    if window == nil then
-        return false
-    end
-    local ok = pcall(function()
-        window:set_right_status(text)
-    end)
-    return ok
-end
-
-local function clear_status_later(window)
-    local ok = pcall(wezterm.time.call_after, M.STATUS_SECONDS, function()
-        pcall(function()
-            window:set_right_status("")
-        end)
-    end)
-    return ok
-end
-
-local function ensure_log()
-    local ok = pcall(log.init)
-    return ok
-end
-
 local function schedule_next()
     local ok, err = pcall(wezterm.time.call_after, M.TICK_SECONDS, M.tick)
     if not ok then
@@ -403,7 +424,7 @@ local function run_tick(now)
     end
 
     snapshot.saved_at = now
-    if write_snapshot(snapshot, "auto") then
+    if write_snapshot(snapshot, "auto", window) then
         last_written = current
         pending = nil
     else
@@ -432,7 +453,6 @@ function M.start()
     end
     started = true
     instance_started_at()
-    ensure_log()
     if not schedule_next() then
         started = false
         return false
@@ -453,7 +473,6 @@ end
 -- ALT+s. Writes immediately, updates the detector baseline, and shows a short
 -- status message. Returns whether the write succeeded.
 function M.save_now(window)
-    ensure_log()
     if window == nil then
         safe_log("warn", "save.failed", { trigger = "manual", reason = "no window" })
         return false
@@ -465,12 +484,13 @@ function M.save_now(window)
             trigger = "manual",
             reason = tostring(err),
         })
+        show_failure(window)
         return false
     end
 
     snapshot.saved_at = now_seconds()
     local current = state.fingerprint(snapshot)
-    if not write_snapshot(snapshot, "manual") then
+    if not write_snapshot(snapshot, "manual", window) then
         return false
     end
 
@@ -478,8 +498,7 @@ function M.save_now(window)
     pending = nil
 
     local clock = os.date("%H:%M:%S")
-    set_right_status(window, " saved " .. clock .. " ")
-    clear_status_later(window)
+    show_status(window, " saved " .. clock .. " ", M.STATUS_SECONDS)
     return true
 end
 
