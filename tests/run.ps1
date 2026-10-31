@@ -2,13 +2,18 @@
 param(
     # Headless logic suite. Runs by default when no switch is given.
     [switch]$Unit = $true,
+    # Headless shell-history suite (tests\shell\run.ps1).
+    [switch]$Shell,
     # Real-GUI integration suite against wezterm-gui.exe.
-    [switch]$Integration
+    [switch]$Integration,
+    # Unit plus shell plus integration.
+    [switch]$All
 )
 
 # An explicit switch selects the suites for that invocation, so -Unit,
-# -Integration and "-Unit -Integration" all do what they say. With neither
-# switch the historical default still runs the unit suite only.
+# -Shell, -Integration and any combination do what they say. -All selects all
+# three. With no switch at all the historical default still runs the unit suite
+# only.
 #
 # -Integration never looks at the window: every scenario writes its own JSON
 # report from inside the app, the runner reads that file, and the runner exits
@@ -19,15 +24,23 @@ $ErrorActionPreference = 'Stop'
 $testsDir = $PSScriptRoot
 
 $unitBound = $PSBoundParameters.ContainsKey('Unit')
+$shellBound = $PSBoundParameters.ContainsKey('Shell')
 $integrationBound = $PSBoundParameters.ContainsKey('Integration')
-if (-not $unitBound -and -not $integrationBound) {
+$allBound = $PSBoundParameters.ContainsKey('All')
+if ($allBound -and [bool]$All) {
     $runUnit = $true
+    $runShell = $true
+    $runIntegration = $true
+} elseif (-not $unitBound -and -not $shellBound -and -not $integrationBound) {
+    $runUnit = $true
+    $runShell = $false
     $runIntegration = $false
 } else {
     $runUnit = $unitBound -and [bool]$Unit
+    $runShell = $shellBound -and [bool]$Shell
     $runIntegration = $integrationBound -and [bool]$Integration
 }
-if (-not $runUnit -and -not $runIntegration) {
+if (-not $runUnit -and -not $runShell -and -not $runIntegration) {
     Write-Output 'FAIL unit: no suite selected'
     exit 1
 }
@@ -102,6 +115,44 @@ function Invoke-UnitSuite {
     }
     Write-Output ("FAIL unit: {0} passed, {1} failed" -f $passed, $failed)
     $script:suiteExit = 1
+}
+
+# ---------------------------------------------------------------------------
+# Shell suite: tests\shell\run.ps1, a headless history-hook proof.
+# ---------------------------------------------------------------------------
+function Invoke-ShellSuite {
+    $script:suiteExit = 1
+    $shellRunner = Join-Path $testsDir 'shell\run.ps1'
+    if (-not (Test-Path -LiteralPath $shellRunner -PathType Leaf)) {
+        Write-Output "FAIL shell: tests\shell\run.ps1 not found at $shellRunner"
+        return
+    }
+
+    $pwsh = (Get-Process -Id $PID).Path
+    try {
+        $lines = @(& $pwsh -NoProfile -NoLogo -NonInteractive -File $shellRunner 2>&1 |
+            ForEach-Object { [string]$_ })
+        $code = $LASTEXITCODE
+    } catch {
+        Write-Output "FAIL shell: could not run $shellRunner : $($_.Exception.Message)"
+        return
+    }
+
+    $sawSummary = $false
+    foreach ($line in $lines) {
+        if ($line -match '^(PASS|FAIL) shell:') {
+            $sawSummary = $true
+        }
+        Write-Output $line
+    }
+    if (-not $sawSummary) {
+        if ($code -eq 0) {
+            Write-Output 'PASS shell: 0 cases'
+        } else {
+            Write-Output "FAIL shell: tests\shell\run.ps1 exited $code"
+        }
+    }
+    $script:suiteExit = if ($code -eq 0) { 0 } else { 1 }
 }
 
 # ---------------------------------------------------------------------------
@@ -574,6 +625,12 @@ function Invoke-IntegrationSuite {
 $failedSuites = $false
 if ($runUnit) {
     Invoke-UnitSuite
+    if ($script:suiteExit -ne 0) {
+        $failedSuites = $true
+    }
+}
+if ($runShell) {
+    Invoke-ShellSuite
     if ($script:suiteExit -ne 0) {
         $failedSuites = $true
     }
