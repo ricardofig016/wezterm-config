@@ -1223,4 +1223,109 @@ return {
             end)
         end,
     },
+    {
+        name = "selfcheck ignores case, slash direction and a trailing separator",
+        run = function(t)
+            local report = fake_selfcheck_report({
+                {
+                    title = "editor",
+                    panes = {
+                        {
+                            id = 11,
+                            rect = { left = 0, top = 0, width = 100, height = 50 },
+                            cwd = "C:\\Work",
+                            live_url = { file_path = "/c:/work/" },
+                        },
+                    },
+                },
+            })
+            t.eq(layout.selfcheck(report), {})
+        end,
+    },
+    {
+        name = "a clean check settles immediately and stays silent",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                local calls = 0
+                with_stub(layout, "selfcheck", function()
+                    calls = calls + 1
+                    return {}
+                end, function()
+                    t.eq(layout.restore(nil, sample_restore_state()), true)
+                end)
+                t.eq(calls, 1, "a clean check must not poll")
+                t.eq(env.spawn.window.statuses, {})
+                t.eq(find_event(events, "selfcheck.drift"), nil)
+            end)
+        end,
+    },
+    {
+        name = "a cwd that settles after one step stays silent",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                local calls = 0
+                with_stub(layout, "selfcheck", function()
+                    calls = calls + 1
+                    if calls == 1 then
+                        return { { kind = "cwd", tab = 1, pane = 10 } }
+                    end
+                    return {}
+                end, function()
+                    t.eq(layout.restore(nil, sample_restore_state()), true)
+                end)
+                t.eq(calls, 2, "the cwd must be rechecked after one settle step")
+                t.eq(env.spawn.window.statuses, {})
+                t.eq(find_event(events, "selfcheck.drift"), nil)
+            end)
+        end,
+    },
+    {
+        name = "a settled cwd leaves only the other findings in the report",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                local calls = 0
+                with_stub(layout, "selfcheck", function()
+                    calls = calls + 1
+                    if calls == 1 then
+                        return {
+                            { kind = "rect", tab = 1, pane = 10 },
+                            { kind = "cwd", tab = 1, pane = 10 },
+                        }
+                    end
+                    return { { kind = "rect", tab = 1, pane = 10 } }
+                end, function()
+                    t.eq(layout.restore(nil, sample_restore_state()), true)
+                end)
+                t.eq(calls, 2)
+                t.eq(env.spawn.window.statuses, { " restore drift: 1 ", "" })
+                local drift = find_event(events, "selfcheck.drift")
+                t.ok(drift ~= nil)
+                t.eq(drift.fields.count, 1)
+                t.eq(drift.fields.kinds, "rect")
+                t.eq(drift.fields.timed_out, nil)
+            end)
+        end,
+    },
+    {
+        name = "a cwd that never settles is reported after the timeout",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                local calls = 0
+                with_stub(layout, "selfcheck", function()
+                    calls = calls + 1
+                    return { { kind = "cwd", tab = 1, pane = 10 } }
+                end, function()
+                    t.eq(layout.restore(nil, sample_restore_state()), true)
+                end)
+                t.eq(calls, 21, "one immediate check plus twenty settle steps")
+                t.eq(env.spawn.window.statuses, { " restore drift: 1 ", "" })
+                local drift = find_event(events, "selfcheck.drift")
+                t.ok(drift ~= nil)
+                t.eq(drift.fields.count, 1)
+                t.eq(drift.fields.kinds, "cwd")
+                t.eq(drift.fields.timed_out, true)
+                t.eq(#env.windows, 1, "a cwd timeout must never fall back")
+            end)
+        end,
+    },
 }

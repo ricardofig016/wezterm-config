@@ -392,6 +392,8 @@ end
 
 local STATUS_CLEAR_SECONDS = 4
 local SELFCHECK_KINDS_SHOWN = 3
+local SELFCHECK_SETTLE_STEPS = 20
+local SELFCHECK_SETTLE_SECONDS = 0.1
 
 -- Status and timer calls are best effort: a missing status area, a closed
 -- window or an odd clock must never turn a self-check or a fallback into a
@@ -426,6 +428,69 @@ local function summarize_findings(findings)
         end
     end
     return table.concat(kinds, ",")
+end
+
+local function report_findings(window, findings, timed_out)
+    local count = #findings
+    if count == 0 then
+        return
+    end
+    local first = findings[1]
+    local fields = {
+        count = count,
+        kinds = summarize_findings(findings),
+        tab = first.tab,
+    }
+    if first.pane ~= nil then
+        fields.pane = first.pane
+    end
+    if timed_out then
+        fields.timed_out = true
+    end
+    log.warn("selfcheck.drift", fields)
+    if not flash_status(window, " restore drift: " .. tostring(count) .. " ") then
+        log.warn("selfcheck.status_failed")
+    end
+end
+
+-- Titles, rectangles and missing panes are stable immediately. Cwd is not: a
+-- freshly split pane reports the cwd handed to pane:split only after its shell
+-- or the process query catches up, so wait in short steps for the cwd findings
+-- to disappear, then report only what is still wrong. A timeout reports the
+-- cwd findings with a timed_out note. Nothing here can escalate into a fallback.
+local function check_selfcheck(window, report, attempt)
+    local checked, findings = pcall(M.selfcheck, report)
+    if not checked then
+        log.warn("selfcheck.failed", { error = tostring(findings) })
+        return
+    end
+    if type(findings) ~= "table" then
+        findings = {}
+    end
+
+    local cwd_pending = false
+    for _, finding in ipairs(findings) do
+        if finding.kind == "cwd" then
+            cwd_pending = true
+            break
+        end
+    end
+
+    if not cwd_pending then
+        report_findings(window, findings, false)
+        return
+    end
+    if attempt >= SELFCHECK_SETTLE_STEPS then
+        report_findings(window, findings, true)
+        return
+    end
+
+    local scheduled = pcall(wezterm.time.call_after, SELFCHECK_SETTLE_SECONDS, function()
+        check_selfcheck(window, report, attempt + 1)
+    end)
+    if not scheduled then
+        report_findings(window, findings, true)
+    end
 end
 
 -- Fallback: keep exactly one usable window. A partially restored window is
@@ -689,23 +754,9 @@ function M.restore(cmd, latest)
 
     -- A self-check problem is logged but never escalates into a fallback: the
     -- layout is already usable and a broken status area must not lose it.
-    local checked, findings = pcall(M.selfcheck, report)
-    if not checked then
-        log.warn("selfcheck.failed", { error = tostring(findings) })
-    elseif type(findings) == "table" and #findings > 0 then
-        local first = findings[1]
-        local fields = {
-            count = #findings,
-            kinds = summarize_findings(findings),
-            tab = first.tab,
-        }
-        if first.pane ~= nil then
-            fields.pane = first.pane
-        end
-        log.warn("selfcheck.drift", fields)
-        if not flash_status(window, " restore drift: " .. tostring(#findings) .. " ") then
-            log.warn("selfcheck.status_failed")
-        end
+    local wired = pcall(check_selfcheck, window, report, 0)
+    if not wired then
+        log.warn("selfcheck.failed", { error = "self-check wiring raised" })
     end
 
     log.info("restore.done", { tabs = tab_count, active_tab = active_tab })
@@ -748,8 +799,8 @@ end
 
 -- Compare a live cwd URL with the saved path. Windows cwds arrive as
 -- /C:/Users/... from the Url and as C:\Users\... from the state, so normalise
--- both to backslashes and lower case; a trailing separator is significant and
--- left alone.
+-- case, forward versus backslash, and a trailing separator: C:\work and
+-- c:/work/ are the same directory.
 local function normalize_cwd(value)
     if value == nil then
         return nil
@@ -763,7 +814,8 @@ local function normalize_cwd(value)
     end
     text = text:gsub("^/([%a]):", "%1:")
     text = text:gsub("/", "\\")
-    return text:lower()
+    text = text:lower()
+    return (text:gsub("\\+$", ""))
 end
 
 -- One cell of slack on every rectangle edge absorbs rounding, not a real
