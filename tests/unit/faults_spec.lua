@@ -237,12 +237,14 @@ local function fake_save_window()
             return { { index = 1, is_active = true, tab = tab } }
         end,
     }
-    return {
-        mux_window = function()
-            return mux
-        end,
-        set_right_status = function() end,
-    }
+    local window = { statuses = {} }
+    function window:mux_window()
+        return mux
+    end
+    function window:set_right_status(text)
+        self.statuses[#self.statuses + 1] = text
+    end
+    return window
 end
 
 local function sessions_entries()
@@ -337,11 +339,17 @@ return {
                         return real_open(path, mode, ...)
                     end
 
-                    local ok, wrote = pcall(save.save_now, fake_save_window())
+                    local fake_window = fake_save_window()
+                    local ok, wrote = pcall(save.save_now, fake_window)
                     io.open = real_open
 
                     t.ok(ok, "save must not raise on an unwritable directory")
                     t.eq(wrote, false, "the failed write must be reported")
+                    t.eq(
+                        fake_window.statuses[1],
+                        " save failed ",
+                        "the failed save must be shown in the status area"
+                    )
                     local failed = find_event(events, "save.failed")
                     t.ok(failed ~= nil, "the refused write must be logged")
                     t.eq(failed.fields.reason, "state.write refused the snapshot")
