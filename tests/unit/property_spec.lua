@@ -50,19 +50,19 @@ local function shuffled(items, rand)
     return copy
 end
 
--- Start from one rectangle and split a randomly chosen splittable leaf, in a
--- random direction, at a random size. Because the split size becomes the size of
--- the second (right or bottom) side, the leaf keeps its position and shrinks,
--- which is exactly the contract of plan's tree.
+-- Start from one region and split a randomly chosen splittable region. A live
+-- WezTerm split reserves one divider cell: with second side b, the first side is
+-- W - 1 - b and the second region starts at first + 1. The leaves this produces
+-- are the rectangles panes_with_info() reports, gutters included.
 local function generate(seed, count, width, height, origin_left, origin_top)
     local rand = lehmer(seed)
-    local leaves = {
+    local regions = {
         { left = origin_left, top = origin_top, width = width, height = height },
     }
-    while #leaves < count do
+    while #regions < count do
         local splittable = {}
-        for index, leaf in ipairs(leaves) do
-            if leaf.width >= 2 or leaf.height >= 2 then
+        for index, region in ipairs(regions) do
+            if region.width >= 3 or region.height >= 3 then
                 splittable[#splittable + 1] = index
             end
         end
@@ -71,43 +71,53 @@ local function generate(seed, count, width, height, origin_left, origin_top)
         end
 
         local pick = splittable[rand(#splittable)]
-        local leaf = leaves[pick]
-        table.remove(leaves, pick)
+        local region = regions[pick]
+        table.remove(regions, pick)
 
         local directions = {}
-        if leaf.width >= 2 then
+        if region.width >= 3 then
             directions[#directions + 1] = "Right"
         end
-        if leaf.height >= 2 then
+        if region.height >= 3 then
             directions[#directions + 1] = "Bottom"
         end
         local direction = directions[rand(#directions)]
 
         if direction == "Right" then
-            local size = rand(leaf.width - 1)
-            local second = {
-                left = leaf.left + leaf.width - size,
-                top = leaf.top,
-                width = size,
-                height = leaf.height,
+            local second_width = rand(region.width - 2)
+            local first = {
+                left = region.left,
+                top = region.top,
+                width = region.width - 1 - second_width,
+                height = region.height,
             }
-            leaf.width = leaf.width - size
-            leaves[#leaves + 1] = leaf
-            leaves[#leaves + 1] = second
+            local second = {
+                left = region.left + first.width + 1,
+                top = region.top,
+                width = second_width,
+                height = region.height,
+            }
+            regions[#regions + 1] = first
+            regions[#regions + 1] = second
         else
-            local size = rand(leaf.height - 1)
-            local second = {
-                left = leaf.left,
-                top = leaf.top + leaf.height - size,
-                width = leaf.width,
-                height = size,
+            local second_height = rand(region.height - 2)
+            local first = {
+                left = region.left,
+                top = region.top,
+                width = region.width,
+                height = region.height - 1 - second_height,
             }
-            leaf.height = leaf.height - size
-            leaves[#leaves + 1] = leaf
-            leaves[#leaves + 1] = second
+            local second = {
+                left = region.left,
+                top = region.top + first.height + 1,
+                width = region.width,
+                height = second_height,
+            }
+            regions[#regions + 1] = first
+            regions[#regions + 1] = second
         end
     end
-    return leaves
+    return regions
 end
 
 local function bounds(rects)
@@ -138,7 +148,7 @@ local function flatten(tree, root)
             return
         end
         if node.direction == "Right" then
-            local first_width = rect.width - node.cells
+            local first_width = rect.width - 1 - node.cells
             walk(node.first, {
                 left = rect.left,
                 top = rect.top,
@@ -146,13 +156,13 @@ local function flatten(tree, root)
                 height = rect.height,
             })
             walk(node.second, {
-                left = rect.left + first_width,
+                left = rect.left + first_width + 1,
                 top = rect.top,
                 width = node.cells,
                 height = rect.height,
             })
         elseif node.direction == "Bottom" then
-            local first_height = rect.height - node.cells
+            local first_height = rect.height - 1 - node.cells
             walk(node.first, {
                 left = rect.left,
                 top = rect.top,
@@ -161,7 +171,7 @@ local function flatten(tree, root)
             })
             walk(node.second, {
                 left = rect.left,
-                top = rect.top + first_height,
+                top = rect.top + first_height + 1,
                 width = rect.width,
                 height = node.cells,
             })
@@ -188,9 +198,8 @@ local function leaf_indices(tree)
     return out
 end
 
--- Pick a pane that has another pane directly to its right and grow it by one
--- cell. A guillotine tiling has no gaps, so such a neighbour starts exactly at
--- this pane's right edge and the mutation overlaps it by one cell while leaving
+-- Pick a pane with a neighbour one divider cell to its right (or below) and
+-- grow it by two cells, so it overlaps that neighbour by one cell while leaving
 -- the bounding box unchanged: exactly the input plan must reject.
 local function overlapping_mutation(rects, rand)
     local candidates = {}
@@ -199,9 +208,14 @@ local function overlapping_mutation(rects, rand)
             if other_index ~= index then
                 local vertical_overlap = other.top < rect.top + rect.height
                     and rect.top < other.top + other.height
-                local touches = other.left == rect.left + rect.width
-                if vertical_overlap and touches then
-                    candidates[#candidates + 1] = index
+                local horizontal_overlap = other.left < rect.left + rect.width
+                    and rect.left < other.left + other.width
+                if other.left == rect.left + rect.width + 1 and vertical_overlap then
+                    candidates[#candidates + 1] = { index = index, axis = "width" }
+                    break
+                end
+                if other.top == rect.top + rect.height + 1 and horizontal_overlap then
+                    candidates[#candidates + 1] = { index = index, axis = "height" }
                     break
                 end
             end
@@ -212,35 +226,8 @@ local function overlapping_mutation(rects, rand)
     end
     local pick = candidates[rand(#candidates)]
     local mutated = deep_copy(rects)
-    mutated[pick].width = mutated[pick].width + 1
-    return mutated, pick
-end
-
--- Shrink a pane by one cell. The bounding box is recomputed and the mutation is
--- only used when the other panes still define the same box, so the result is
--- guaranteed to be a hole inside a fixed box, never a smaller valid tiling.
-local function hole_mutation(rects, rand)
-    local before_left, before_top, before_right, before_bottom = bounds(rects)
-    local candidates = {}
-    for index, rect in ipairs(rects) do
-        if rect.width > 1 then
-            local mutated = deep_copy(rects)
-            mutated[index].width = mutated[index].width - 1
-            local left, top, right, bottom = bounds(mutated)
-            if
-                left == before_left
-                and top == before_top
-                and right == before_right
-                and bottom == before_bottom
-            then
-                candidates[#candidates + 1] = mutated
-            end
-        end
-    end
-    if #candidates == 0 then
-        return nil
-    end
-    return candidates[rand(#candidates)]
+    mutated[pick.index][pick.axis] = mutated[pick.index][pick.axis] + 2
+    return mutated, pick.index
 end
 
 local SEED_COUNT = 30
@@ -339,8 +326,9 @@ specs[#specs + 1] = {
 specs[#specs + 1] = {
     name = "plan rejects a layout with a hole inside its bounding box",
     run = function(t)
-        -- A four-pane 2x2 tiling with the top-left pane one cell narrower: the
-        -- other panes still span the same box, so the missing cells are a hole.
+        -- A 2x2 layout with the top-left pane one cell narrower: the other panes
+        -- still span the same box, so the missing cells are a hole, not a
+        -- one-cell divider spanning the split.
         t.eq(
             layout.plan({
                 { left = 0, top = 0, width = 59, height = 25 },
@@ -351,19 +339,22 @@ specs[#specs + 1] = {
             nil,
             "a one cell hole must not produce a plan"
         )
+        -- The bottom-right region is missing, so the top row does not define a
+        -- full-width sibling of the bottom-left pane.
         t.eq(
             layout.plan({
-                { left = 0, top = 0, width = 100, height = 24 },
-                { left = 0, top = 25, width = 100, height = 25 },
+                { left = 0, top = 0, width = 59, height = 25 },
+                { left = 60, top = 0, width = 60, height = 25 },
+                { left = 0, top = 25, width = 60, height = 25 },
             }),
             nil,
-            "a one cell gap between rows must not produce a plan"
+            "a missing bottom-right region must not produce a plan"
         )
     end,
 }
 
 specs[#specs + 1] = {
-    name = "plan rejects a corrupted layout for every seed",
+    name = "plan rejects an overlap for every seed",
     run = function(t)
         for seed = 1, SEED_COUNT do
             local count = 2 + (seed % (PANE_MAX - 1))
@@ -371,26 +362,14 @@ specs[#specs + 1] = {
             local rand = lehmer(seed * 1229 + count)
 
             local overlap = overlapping_mutation(generated, rand)
-            if overlap ~= nil then
-                t.eq(
-                    layout.plan(overlap),
-                    nil,
-                    string.format("seed %d: an overlapping rectangle must not produce a plan", seed)
-                )
+            if overlap == nil then
+                t.fail(string.format("seed %d: could not build an overlapping layout to test", seed))
             end
-
-            local hole = hole_mutation(generated, rand)
-            if hole ~= nil then
-                t.eq(
-                    layout.plan(hole),
-                    nil,
-                    string.format("seed %d: a hole in the bounding box must not produce a plan", seed)
-                )
-            end
-
-            if overlap == nil and hole == nil then
-                t.fail(string.format("seed %d: could not build a corrupted layout to test", seed))
-            end
+            t.eq(
+                layout.plan(overlap),
+                nil,
+                string.format("seed %d: an overlapping rectangle must not produce a plan", seed)
+            )
         end
     end,
 }

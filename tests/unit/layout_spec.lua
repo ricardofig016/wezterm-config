@@ -39,7 +39,8 @@ local function flatten(tree, root)
             return
         end
         if node.direction == "Right" then
-            local first_width = rect.width - node.cells
+            -- WezTerm reserves one divider cell between the siblings.
+            local first_width = rect.width - 1 - node.cells
             walk(node.first, {
                 left = rect.left,
                 top = rect.top,
@@ -47,13 +48,13 @@ local function flatten(tree, root)
                 height = rect.height,
             })
             walk(node.second, {
-                left = rect.left + first_width,
+                left = rect.left + first_width + 1,
                 top = rect.top,
                 width = node.cells,
                 height = rect.height,
             })
         elseif node.direction == "Bottom" then
-            local first_height = rect.height - node.cells
+            local first_height = rect.height - 1 - node.cells
             walk(node.first, {
                 left = rect.left,
                 top = rect.top,
@@ -62,7 +63,7 @@ local function flatten(tree, root)
             })
             walk(node.second, {
                 left = rect.left,
-                top = rect.top + first_height,
+                top = rect.top + first_height + 1,
                 width = rect.width,
                 height = node.cells,
             })
@@ -102,54 +103,68 @@ local function lehmer(seed)
     end
 end
 
+-- Build a gutter-aware layout the way WezTerm does: splitting a region of width
+-- W with second side b leaves first side W - 1 - b and one divider cell, and the
+-- second region starts at first + 1. The returned tables are the leaf
+-- rectangles exactly as panes_with_info() would report them.
 local function make_layout(seed, count, width, height)
     local rand = lehmer(seed)
-    local leaves = { { left = 0, top = 0, width = width, height = height } }
-    while #leaves < count do
+    local regions = { { left = 0, top = 0, width = width, height = height } }
+    while #regions < count do
         local splittable = {}
-        for index, leaf in ipairs(leaves) do
-            if leaf.width >= 2 or leaf.height >= 2 then
+        for index, region in ipairs(regions) do
+            if region.width >= 3 or region.height >= 3 then
                 splittable[#splittable + 1] = index
             end
         end
         local pick = splittable[rand(#splittable)]
-        local leaf = leaves[pick]
-        table.remove(leaves, pick)
+        local region = regions[pick]
+        table.remove(regions, pick)
 
         local directions = {}
-        if leaf.width >= 2 then
+        if region.width >= 3 then
             directions[#directions + 1] = "Right"
         end
-        if leaf.height >= 2 then
+        if region.height >= 3 then
             directions[#directions + 1] = "Bottom"
         end
         local direction = directions[rand(#directions)]
 
         if direction == "Right" then
-            local size = rand(leaf.width - 1)
-            local second = {
-                left = leaf.left + leaf.width - size,
-                top = leaf.top,
-                width = size,
-                height = leaf.height,
+            local second_width = rand(region.width - 2)
+            local first = {
+                left = region.left,
+                top = region.top,
+                width = region.width - 1 - second_width,
+                height = region.height,
             }
-            leaf.width = leaf.width - size
-            leaves[#leaves + 1] = leaf
-            leaves[#leaves + 1] = second
+            local second = {
+                left = region.left + first.width + 1,
+                top = region.top,
+                width = second_width,
+                height = region.height,
+            }
+            regions[#regions + 1] = first
+            regions[#regions + 1] = second
         else
-            local size = rand(leaf.height - 1)
-            local second = {
-                left = leaf.left,
-                top = leaf.top + leaf.height - size,
-                width = leaf.width,
-                height = size,
+            local second_height = rand(region.height - 2)
+            local first = {
+                left = region.left,
+                top = region.top,
+                width = region.width,
+                height = region.height - 1 - second_height,
             }
-            leaf.height = leaf.height - size
-            leaves[#leaves + 1] = leaf
-            leaves[#leaves + 1] = second
+            local second = {
+                left = region.left,
+                top = region.top + first.height + 1,
+                width = region.width,
+                height = second_height,
+            }
+            regions[#regions + 1] = first
+            regions[#regions + 1] = second
         end
     end
-    return leaves
+    return regions
 end
 
 local function shuffled(leaves, rand)
@@ -181,8 +196,10 @@ local function make_fake_pane_factory()
     return fake_pane, calls
 end
 
-local corner = { left = 0, top = 0, width = 100, height = 50 }
-local right_top = { left = 100, top = 0, width = 100, height = 25 }
+-- Live geometry from tests\fixtures\five-pane.json: 190x46, three split
+-- boundaries, one divider cell between every pair of siblings.
+local corner = { left = 0, top = 0, width = 99, height = 50 }
+local right_top = { left = 100, top = 0, width = 100, height = 24 }
 local right_bottom = { left = 100, top = 25, width = 100, height = 25 }
 
 local three_pane_rects = { corner, right_top, right_bottom }
@@ -371,15 +388,15 @@ local function sample_restore_state(overrides)
             {
                 title = "editor",
                 panes = {
-                    { id = 10, rect = { left = 0, top = 0, width = 100, height = 50 }, cwd = "C:\\a" },
-                    { id = 11, rect = { left = 100, top = 0, width = 100, height = 25 }, cwd = "C:\\b" },
+                    { id = 10, rect = { left = 0, top = 0, width = 99, height = 50 }, cwd = "C:\\a" },
+                    { id = 11, rect = { left = 100, top = 0, width = 100, height = 24 }, cwd = "C:\\b" },
                     { id = 12, rect = { left = 100, top = 25, width = 100, height = 25 }, cwd = "C:\\c" },
                 },
             },
             {
                 title = "logs",
                 panes = {
-                    { id = 20, rect = { left = 0, top = 0, width = 100, height = 50 }, cwd = "C:\\d" },
+                    { id = 20, rect = { left = 0, top = 0, width = 99, height = 50 }, cwd = "C:\\d" },
                     { id = 21, rect = { left = 100, top = 0, width = 100, height = 50 }, cwd = "C:\\e" },
                 },
             },
@@ -438,11 +455,53 @@ return {
         end,
     },
     {
+        name = "the captured five-pane fixture round-trips with its dividers",
+        run = function(t)
+            -- tests\fixtures\five-pane.json, captured from a live 190x46 window.
+            local rects = {
+                { left = 0, top = 0, width = 129, height = 20 },
+                { left = 130, top = 0, width = 60, height = 20 },
+                { left = 0, top = 21, width = 129, height = 25 },
+                { left = 130, top = 21, width = 60, height = 14 },
+                { left = 130, top = 36, width = 60, height = 10 },
+            }
+            local tree = layout.plan(rects)
+            if tree == nil then
+                t.fail("the live five-pane geometry must plan")
+            end
+            t.eq(tree, {
+                direction = "Right",
+                cells = 60,
+                first = {
+                    direction = "Bottom",
+                    cells = 25,
+                    first = { leaf = 1 },
+                    second = { leaf = 3 },
+                },
+                second = {
+                    direction = "Bottom",
+                    cells = 25,
+                    first = { leaf = 2 },
+                    second = {
+                        direction = "Bottom",
+                        cells = 10,
+                        first = { leaf = 4 },
+                        second = { leaf = 5 },
+                    },
+                },
+            })
+            local actual = flatten(tree, { left = 0, top = 0, width = 190, height = 46 })
+            for index, rect in ipairs(rects) do
+                t.eq(actual[index], rect, "fixture leaf " .. index)
+            end
+        end,
+    },
+    {
         name = "plan emits the pinned tree shape with cells for the second side",
         run = function(t)
             t.eq(
                 layout.plan({
-                    { left = 0, top = 0, width = 120, height = 50 },
+                    { left = 0, top = 0, width = 119, height = 50 },
                     { left = 120, top = 0, width = 80, height = 50 },
                 }),
                 { direction = "Right", cells = 80, first = { leaf = 1 }, second = { leaf = 2 } }
@@ -450,15 +509,11 @@ return {
             t.eq(
                 layout.plan({
                     { left = 0, top = 0, width = 100, height = 20 },
-                    { left = 0, top = 20, width = 100, height = 30 },
+                    { left = 0, top = 21, width = 100, height = 30 },
                 }),
                 { direction = "Bottom", cells = 30, first = { leaf = 1 }, second = { leaf = 2 } }
             )
-            t.eq(layout.plan({
-                { left = 0, top = 0, width = 100, height = 50 },
-                { left = 100, top = 0, width = 100, height = 25 },
-                { left = 100, top = 25, width = 100, height = 25 },
-            }), {
+            t.eq(layout.plan(three_pane_rects), {
                 direction = "Right",
                 cells = 100,
                 first = { leaf = 1 },
@@ -475,9 +530,9 @@ return {
         name = "plan is pure and deterministic",
         run = function(t)
             local input = {
-                { left = 0, top = 0, width = 120, height = 50 },
+                { left = 0, top = 0, width = 119, height = 50 },
                 { left = 120, top = 0, width = 80, height = 20 },
-                { left = 120, top = 20, width = 80, height = 30 },
+                { left = 120, top = 21, width = 80, height = 29 },
             }
             local before = deep_copy(input)
             local first = layout.plan(input)
@@ -487,7 +542,7 @@ return {
         end,
     },
     {
-        name = "plan rejects empty, malformed, overlapping and non-guillotine inputs",
+        name = "plan rejects empty, malformed, overlapping and non-gutter inputs",
         run = function(t)
             t.eq(layout.plan(nil), nil)
             t.eq(layout.plan({}), nil)
@@ -501,8 +556,32 @@ return {
                 nil,
                 "overlapping rectangles"
             )
-            -- Classic pinwheel: the area is exact but no single cut spans the
-            -- full width or height, so no WezTerm split order can rebuild it.
+            t.eq(
+                layout.plan({
+                    { left = 0, top = 0, width = 100, height = 50 },
+                    { left = 100, top = 0, width = 100, height = 50 },
+                }),
+                nil,
+                "an exact tiling has no divider and must not produce a plan"
+            )
+            t.eq(
+                layout.plan({
+                    { left = 0, top = 0, width = 99, height = 50 },
+                    { left = 101, top = 0, width = 100, height = 50 },
+                }),
+                nil,
+                "a two cell gap is not a divider"
+            )
+            t.eq(
+                layout.plan({
+                    { left = 0, top = 0, width = 100, height = 50 },
+                    { left = 101, top = 0, width = 99, height = 25 },
+                }),
+                nil,
+                "a one cell gap that does not span the split must be refused"
+            )
+            -- Classic pinwheel: no single cut spans the full width or height,
+            -- so no WezTerm split order can rebuild it.
             t.eq(
                 layout.plan({
                     { left = 0, top = 0, width = 2, height = 1 },
@@ -631,7 +710,7 @@ return {
 
             local vertical = layout.plan({
                 { left = 0, top = 0, width = 100, height = 20 },
-                { left = 0, top = 20, width = 100, height = 30 },
+                { left = 0, top = 21, width = 100, height = 30 },
             })
             t.eq(vertical.direction, "Bottom", "a bottom split is spelled Bottom")
         end,
@@ -780,7 +859,7 @@ return {
                     {
                         title = "broken",
                         panes = {
-                            { id = 20, rect = { left = 0, top = 0, width = 100, height = 50 }, cwd = "C:\\d" },
+                            { id = 20, rect = { left = 0, top = 0, width = 99, height = 50 }, cwd = "C:\\d" },
                             { id = 21, rect = { left = 100, top = 0, width = 100, height = 50 }, cwd = "C:\\e" },
                         },
                     },
@@ -807,7 +886,7 @@ return {
                         panes = {
                             {
                                 id = 10,
-                                rect = { left = 0, top = 0, width = 100, height = 50 },
+                                rect = { left = 0, top = 0, width = 99, height = 50 },
                                 cwd = "C:\\a",
                                 foreground = { argv = { "less", "app.log" }, alt_screen = true },
                             },

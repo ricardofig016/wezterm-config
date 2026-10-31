@@ -9,10 +9,18 @@
 --             first = <left/top subtree>,
 --             second = <right/bottom subtree> }
 --
--- plan is pure: it never mutates its input, it returns nil for a list that is
--- not an exact guillotine tiling, and it reproduces every rectangle at zero
--- cells of drift. Leaves keep the input order rather than geometric order, so
--- replays and expected rectangles stay keyed by the saved pane index.
+-- Live WezTerm panes never tile their bounding box: every split reserves a
+-- one-cell divider between siblings. For a Right split of a parent W cells wide
+-- whose second side is b, the first side is a = W - 1 - b, the divider is the
+-- cell after it, and the second pane starts at parent.left + a + 1; Bottom
+-- splits use the same arithmetic on rows, and nested splits apply inside a
+-- child's rectangle. plan accepts exactly that geometry, rectangles as
+-- panes_with_info() reports them with the gutters included, and returns nil for
+-- an exact tiling, an overlap, or any gap that is not a one-cell divider. The
+-- tree still carries `cells` = the second side's size, which is exactly the
+-- numeric size pane:split needs. plan is pure and reproduces every rectangle at
+-- zero cells of drift. Leaves keep the input order rather than geometric order,
+-- so replays and expected rectangles stay keyed by the saved pane index.
 --
 -- replay(pane, tree, panes) walks the tree, calling pane:split for each split
 -- with a numeric size in cells. pane:split's direction vocabulary is Left,
@@ -62,16 +70,14 @@ end
 local function bounds(items)
     local left, top = math.huge, math.huge
     local right, bottom = -math.huge, -math.huge
-    local area = 0
     for _, item in ipairs(items) do
         local rect = item.rect
         left = math.min(left, rect.left)
         top = math.min(top, rect.top)
         right = math.max(right, rect.left + rect.width)
         bottom = math.max(bottom, rect.top + rect.height)
-        area = area + rect.width * rect.height
     end
-    return left, top, right, bottom, area
+    return left, top, right, bottom
 end
 
 local function matches_box(items, left, top, right, bottom)
@@ -82,8 +88,10 @@ local function matches_box(items, left, top, right, bottom)
         and first_bottom == bottom
 end
 
--- Split items into the two sides of a full-length cut. A rectangle that
--- straddles the cut means this boundary is not a valid split.
+-- Split items into the two sides of a full-length cut whose one-cell divider
+-- starts at boundary. The second side therefore starts at boundary + 1. A
+-- rectangle that straddles the cut or sits in the divider means this boundary is
+-- not a valid split.
 local function partition(items, axis, boundary)
     local first, second = {}, {}
     for _, item in ipairs(items) do
@@ -92,7 +100,7 @@ local function partition(items, axis, boundary)
             local rect_right = rect.left + rect.width
             if rect_right <= boundary then
                 first[#first + 1] = item
-            elseif rect.left >= boundary then
+            elseif rect.left >= boundary + 1 then
                 second[#second + 1] = item
             else
                 return nil
@@ -101,7 +109,7 @@ local function partition(items, axis, boundary)
             local rect_bottom = rect.top + rect.height
             if rect_bottom <= boundary then
                 first[#first + 1] = item
-            elseif rect.top >= boundary then
+            elseif rect.top >= boundary + 1 then
                 second[#second + 1] = item
             else
                 return nil
@@ -114,14 +122,15 @@ local function partition(items, axis, boundary)
     return first, second
 end
 
--- Prefer the leftmost vertical cut, then the topmost horizontal cut. Both
--- sides must span the full extent of the other axis, which is what makes the
--- cut reconstruct the boxes exactly.
+-- Prefer the leftmost vertical cut, then the topmost horizontal cut. The
+-- divider is one cell; the two sides must span the full extent of the other
+-- axis, and the second side starts one cell past the first side's right (or
+-- bottom) edge.
 local function find_split(items, left, top, right, bottom)
     local xs, seen_x = {}, {}
     for _, item in ipairs(items) do
         local edge = item.rect.left + item.rect.width
-        if edge > left and edge < right and not seen_x[edge] then
+        if edge > left and edge + 1 < right and not seen_x[edge] then
             seen_x[edge] = true
             xs[#xs + 1] = edge
         end
@@ -132,13 +141,15 @@ local function find_split(items, left, top, right, bottom)
         if
             first
             and matches_box(first, left, top, x, bottom)
-            and matches_box(second, x, top, right, bottom)
+            and matches_box(second, x + 1, top, right, bottom)
         then
             return {
                 direction = "Right",
-                cells = right - x,
+                cells = right - (x + 1),
                 first = first,
                 second = second,
+                first_region = { left = left, top = top, right = x, bottom = bottom },
+                second_region = { left = x + 1, top = top, right = right, bottom = bottom },
             }
         end
     end
@@ -146,7 +157,7 @@ local function find_split(items, left, top, right, bottom)
     local ys, seen_y = {}, {}
     for _, item in ipairs(items) do
         local edge = item.rect.top + item.rect.height
-        if edge > top and edge < bottom and not seen_y[edge] then
+        if edge > top and edge + 1 < bottom and not seen_y[edge] then
             seen_y[edge] = true
             ys[#ys + 1] = edge
         end
@@ -157,13 +168,15 @@ local function find_split(items, left, top, right, bottom)
         if
             first
             and matches_box(first, left, top, right, y)
-            and matches_box(second, left, y, right, bottom)
+            and matches_box(second, left, y + 1, right, bottom)
         then
             return {
                 direction = "Bottom",
-                cells = bottom - y,
+                cells = bottom - (y + 1),
                 first = first,
                 second = second,
+                first_region = { left = left, top = top, right = right, bottom = y },
+                second_region = { left = left, top = y + 1, right = right, bottom = bottom },
             }
         end
     end
@@ -171,7 +184,7 @@ local function find_split(items, left, top, right, bottom)
     return nil
 end
 
-local function plan_items(items)
+local function plan_items(items, region)
     if #items == 0 then
         return nil
     end
@@ -179,23 +192,16 @@ local function plan_items(items)
         return { leaf = items[1].index }
     end
 
-    local left, top, right, bottom, area = bounds(items)
-    -- A guillotine tiling of the bounding box has exactly the box's area; this
-    -- rejects overlaps and holes before the cut search has to reason about them.
-    if area ~= (right - left) * (bottom - top) then
-        return nil
-    end
-
-    local split = find_split(items, left, top, right, bottom)
+    local split = find_split(items, region.left, region.top, region.right, region.bottom)
     if split == nil then
         return nil
     end
 
-    local first = plan_items(split.first)
+    local first = plan_items(split.first, split.first_region)
     if first == nil then
         return nil
     end
-    local second = plan_items(split.second)
+    local second = plan_items(split.second, split.second_region)
     if second == nil then
         return nil
     end
@@ -222,7 +228,9 @@ function M.plan(rects)
     if #items == 0 then
         return nil
     end
-    return plan_items(items)
+
+    local left, top, right, bottom = bounds(items)
+    return plan_items(items, { left = left, top = top, right = right, bottom = bottom })
 end
 
 -- The pane a split creates keeps the first leaf of that split's second
