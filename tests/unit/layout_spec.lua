@@ -527,6 +527,45 @@ return {
         end,
     },
     {
+        name = "random layouts survive plan and replay with their saved rectangles",
+        run = function(t)
+            for count = 1, 8 do
+                for seed = 1, 8 do
+                    local width = 80 + ((seed * 37) % 120)
+                    local height = 20 + ((seed * 11) % 40)
+                    local generated = make_layout(seed * 101 + count, count, width, height)
+                    local rand = lehmer(seed * 977 + count * 13)
+                    local input = shuffled(generated, rand)
+                    local context = string.format("%d panes, seed %d", count, seed)
+
+                    local tree = layout.plan(input)
+                    if tree == nil then
+                        t.fail(context .. ": plan returned nil")
+                    end
+
+                    local panes = {}
+                    for index, rect in ipairs(input) do
+                        panes[index] = {
+                            id = index,
+                            rect = rect,
+                            cwd = "C:\\pane" .. index,
+                        }
+                    end
+
+                    local make_pane = make_fake_pane_factory()
+                    local created, expected = layout.replay(make_pane(), tree, panes)
+                    if created == nil then
+                        t.fail(context .. ": replay failed: " .. tostring(expected))
+                    end
+                    t.eq(#created, count - 1, context .. ": one pane is created per split")
+                    for index, rect in ipairs(input) do
+                        t.eq(expected[index], rect, context .. ": leaf " .. index .. " rectangle")
+                    end
+                end
+            end
+        end,
+    },
+    {
         name = "the captured five-pane fixture round-trips with its dividers",
         run = function(t)
             -- tests\fixtures\five-pane.json, captured from a live 190x46 window.
