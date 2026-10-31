@@ -423,7 +423,7 @@ local function fake_selfcheck_report(tabs)
         local infos, panes = {}, {}
         for pane_index, pane_spec in ipairs(tab_spec.panes) do
             local url = pane_spec.live_url
-            if url == nil then
+            if url == nil and not pane_spec.unreported then
                 url = { file_path = pane_spec.cwd }
             end
             local pane = {
@@ -1239,7 +1239,9 @@ return {
                     },
                 },
             })
-            t.eq(layout.selfcheck(report), {})
+            local findings, unknown = layout.selfcheck(report)
+            t.eq(findings, {})
+            t.eq(unknown, {})
         end,
     },
     {
@@ -1307,7 +1309,7 @@ return {
         end,
     },
     {
-        name = "a cwd that never settles is reported after the timeout",
+        name = "a reported cwd mismatch keeps driving drift and status after the settle window",
         run = function(t)
             with_restore_env({}, function(env, events)
                 local calls = 0
@@ -1317,7 +1319,7 @@ return {
                 end, function()
                     t.eq(layout.restore(nil, sample_restore_state()), true)
                 end)
-                t.eq(calls, 21, "one immediate check plus twenty settle steps")
+                t.eq(calls, 101, "one immediate check plus one hundred settle steps")
                 t.eq(env.spawn.window.statuses, { " restore drift: 1 ", "" })
                 local drift = find_event(events, "selfcheck.drift")
                 t.ok(drift ~= nil)
@@ -1355,6 +1357,81 @@ return {
                 t.eq(env.spawn.args.width, 99)
                 t.eq(env.spawn.args.set_environment_variables.WEZTERM_SESSION_HISTORY_KEY, "0")
                 t.eq(env.spawn.pane.activations, 1, "pane id 0 must be found and activated")
+            end)
+        end,
+    },
+    {
+        name = "an unreported cwd is unknown, not a finding",
+        run = function(t)
+            local report = fake_selfcheck_report({
+                {
+                    title = "editor",
+                    panes = {
+                        {
+                            id = 11,
+                            rect = { left = 0, top = 0, width = 50, height = 50 },
+                            cwd = "C:\\a",
+                            unreported = true,
+                        },
+                        {
+                            id = 12,
+                            rect = { left = 51, top = 0, width = 49, height = 50 },
+                            cwd = "C:\\b",
+                            live_url = "",
+                        },
+                    },
+                },
+            })
+            local findings, unknown = layout.selfcheck(report)
+            t.eq(findings, {}, "an unreported cwd is not drift")
+            t.eq(unknown, {
+                { tab = 1, pane = 11 },
+                { tab = 1, pane = 12 },
+            })
+        end,
+    },
+    {
+        name = "an unreported cwd that arrives late stays silent",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                local calls = 0
+                with_stub(layout, "selfcheck", function()
+                    calls = calls + 1
+                    if calls <= 3 then
+                        return {}, { { tab = 1, pane = 10 } }
+                    end
+                    return {}
+                end, function()
+                    t.eq(layout.restore(nil, sample_restore_state()), true)
+                end)
+                t.eq(calls, 4)
+                t.eq(env.spawn.window.statuses, {})
+                t.eq(find_event(events, "selfcheck.drift"), nil)
+                t.eq(find_event(events, "selfcheck.cwd_unknown"), nil)
+            end)
+        end,
+    },
+    {
+        name = "a cwd that never reports logs cwd_unknown without status or drift",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                local calls = 0
+                with_stub(layout, "selfcheck", function()
+                    calls = calls + 1
+                    return {}, { { tab = 1, pane = 10 } }
+                end, function()
+                    t.eq(layout.restore(nil, sample_restore_state()), true)
+                end)
+                t.eq(calls, 101)
+                t.eq(env.spawn.window.statuses, {})
+                t.eq(find_event(events, "selfcheck.drift"), nil)
+                local unknown_event = find_event(events, "selfcheck.cwd_unknown")
+                t.ok(unknown_event ~= nil)
+                t.eq(unknown_event.level, "info")
+                t.eq(unknown_event.fields.count, 1)
+                t.eq(unknown_event.fields.tab, 1)
+                t.eq(unknown_event.fields.pane, 10)
+                t.eq(#env.windows, 1)
             end)
         end,
     },

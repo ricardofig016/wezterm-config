@@ -392,7 +392,9 @@ end
 
 local STATUS_CLEAR_SECONDS = 4
 local SELFCHECK_KINDS_SHOWN = 3
-local SELFCHECK_SETTLE_STEPS = 20
+-- About ten seconds in short steps: a cold first pwsh prompt can take longer
+-- than the old two-second window before it reports its directory.
+local SELFCHECK_SETTLE_STEPS = 100
 local SELFCHECK_SETTLE_SECONDS = 0.1
 
 -- Status and timer calls are best effort: a missing status area, a closed
@@ -454,12 +456,36 @@ local function report_findings(window, findings, timed_out)
 end
 
 -- Titles, rectangles and missing panes are stable immediately. Cwd is not: a
--- freshly split pane reports the cwd handed to pane:split only after its shell
--- or the process query catches up, so wait in short steps for the cwd findings
--- to disappear, then report only what is still wrong. A timeout reports the
--- cwd findings with a timed_out note. Nothing here can escalate into a fallback.
+-- fresh pane reports the cwd handed to pane:split only once its shell (or the
+-- process query) catches up. An unreported cwd is unknown, not drift, so wait
+-- in short steps while any pane is unreported or reports a value that does not
+-- match yet, then report only what is still wrong. A timeout reports genuine
+-- cwd drift with a timed_out note and logs still-unreported panes as
+-- selfcheck.cwd_unknown without touching the status. Nothing here can escalate
+-- into a fallback.
+local function cwd_finding(findings)
+    for _, finding in ipairs(findings) do
+        if finding.kind == "cwd" then
+            return true
+        end
+    end
+    return false
+end
+
+local function log_unknown(unknown)
+    if #unknown == 0 then
+        return
+    end
+    local first = unknown[1]
+    log.info("selfcheck.cwd_unknown", {
+        count = #unknown,
+        tab = first.tab,
+        pane = first.pane,
+    })
+end
+
 local function check_selfcheck(window, report, attempt)
-    local checked, findings = pcall(M.selfcheck, report)
+    local checked, findings, unknown = pcall(M.selfcheck, report)
     if not checked then
         log.warn("selfcheck.failed", { error = tostring(findings) })
         return
@@ -467,21 +493,19 @@ local function check_selfcheck(window, report, attempt)
     if type(findings) ~= "table" then
         findings = {}
     end
-
-    local cwd_pending = false
-    for _, finding in ipairs(findings) do
-        if finding.kind == "cwd" then
-            cwd_pending = true
-            break
-        end
+    if type(unknown) ~= "table" then
+        unknown = {}
     end
 
-    if not cwd_pending then
+    local drifted = cwd_finding(findings)
+    if #unknown == 0 and not drifted then
         report_findings(window, findings, false)
         return
     end
+
     if attempt >= SELFCHECK_SETTLE_STEPS then
-        report_findings(window, findings, true)
+        report_findings(window, findings, drifted)
+        log_unknown(unknown)
         return
     end
 
@@ -489,7 +513,8 @@ local function check_selfcheck(window, report, attempt)
         check_selfcheck(window, report, attempt + 1)
     end)
     if not scheduled then
-        report_findings(window, findings, true)
+        report_findings(window, findings, drifted)
+        log_unknown(unknown)
     end
 end
 
@@ -797,20 +822,42 @@ local function pane_id_of(pane)
     return nil
 end
 
--- Compare a live cwd URL with the saved path. Windows cwds arrive as
--- /C:/Users/... from the Url and as C:\Users\... from the state, so normalise
--- case, forward versus backslash, and a trailing separator: C:\work and
--- c:/work/ are the same directory.
-local function normalize_cwd(value)
+-- A Url or a plain path from pane:get_current_working_dir(). Missing or empty
+-- means the pane has not reported yet; it is not a directory mismatch.
+local function reported_cwd(value)
     if value == nil then
         return nil
     end
     local text
-    if type(value) == "table" then
-        text = value.file_path or value.path
+    if type(value) == "string" then
+        text = value
+    else
+        local ok, file_path = pcall(function()
+            return value.file_path
+        end)
+        if ok and type(file_path) == "string" then
+            text = file_path
+        end
     end
-    if type(text) ~= "string" then
-        text = tostring(value)
+    if type(text) ~= "string" or text == "" then
+        return nil
+    end
+    if text:sub(1, 7):lower() == "file://" then
+        text = text:sub(8):gsub("%%(%x%x)", function(hex)
+            return string.char(tonumber(hex, 16))
+        end)
+    end
+    return text
+end
+
+-- Compare a reported cwd with the saved path. Windows cwds arrive as
+-- /C:/Users/... from the Url and as C:\Users\... from the state, so normalise
+-- case, forward versus backslash, and a trailing separator: C:\work and
+-- c:/work/ are the same directory.
+local function normalize_cwd(value)
+    local text = reported_cwd(value)
+    if text == nil then
+        return nil
     end
     text = text:gsub("^/([%a]):", "%1:")
     text = text:gsub("/", "\\")
@@ -836,11 +883,13 @@ end
 
 -- Compare the live tabs and panes against the report restore built from the
 -- plan. Returns an array of { kind, tab, pane } findings (pane is absent for a
--- tab-level title finding) and never raises for a missing or odd live value.
+-- tab-level title finding) and an array of panes whose cwd has not been
+-- reported yet. Never raises for a missing or odd live value.
 function M.selfcheck(report)
     local findings = {}
+    local unknown = {}
     if type(report) ~= "table" or type(report.tabs) ~= "table" then
-        return findings
+        return findings, unknown
     end
 
     for tab_index, expected_tab in ipairs(report.tabs) do
@@ -893,18 +942,26 @@ function M.selfcheck(report)
                         live_cwd = url
                     end
                 end
-                if normalize_cwd(live_cwd) ~= normalize_cwd(expected_pane.cwd) then
-                    findings[#findings + 1] = {
-                        kind = "cwd",
-                        tab = tab_index,
-                        pane = expected_pane.id,
-                    }
+                if type(expected_pane.cwd) == "string" and expected_pane.cwd ~= "" then
+                    local reported = reported_cwd(live_cwd)
+                    if reported == nil then
+                        unknown[#unknown + 1] = {
+                            tab = tab_index,
+                            pane = expected_pane.id,
+                        }
+                    elseif normalize_cwd(reported) ~= normalize_cwd(expected_pane.cwd) then
+                        findings[#findings + 1] = {
+                            kind = "cwd",
+                            tab = tab_index,
+                            pane = expected_pane.id,
+                        }
+                    end
                 end
             end
         end
     end
 
-    return findings
+    return findings, unknown
 end
 
 return M
