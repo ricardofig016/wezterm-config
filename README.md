@@ -20,26 +20,22 @@ staleness and newest-file selection. `shell\history.ps1` points PSReadLine at
 
 ## Install
 
-The working config until cutover is `C:\Users\rfigueiredo\.wezterm.lua`, which
-still loads the archived plugin. Development runs this repository's entry with
-`--config-file` and leaves that file alone.
-
-Cutover is step 13. It backs up the old config to
-`C:\Users\rfigueiredo\.wezterm.lua.pre-session-layer.bak` and replaces
-`C:\Users\rfigueiredo\.wezterm.lua` with this three-statement loader:
+The cutover happened at step 13. `C:\Users\rfigueiredo\.wezterm.lua` is the
+three-statement loader:
 
 ```lua
-local root = "C:/Users/rfigueiredo/Desktop/personal/projects/wezterm-config"
-package.path = root .. "/?.lua;" .. root .. "/?/init.lua;" .. package.path
-return dofile(root .. "/wezterm.lua")
+local repo = "C:/Users/rfigueiredo/Desktop/personal/projects/wezterm-config"
+package.path = repo .. "/?.lua;" .. repo .. "/?/init.lua;" .. package.path
+return dofile(repo .. "/wezterm.lua")
 ```
 
 The loader puts the repository on `package.path` and evaluates the entry, so
 `require("lib.config")` and the other modules resolve from the repository.
-WezTerm reads `~/.wezterm.lua` at startup. Until step 13 runs, the loader is a
-target, not a fact.
+WezTerm reads `~/.wezterm.lua` at startup, and a cold launch through the loader
+restored the saved layout. The rollback section below and `docs\rollback.md`
+name the pre-cutover config and its backups.
 
-The shell half is already installed.
+The shell half is installed.
 `C:\Users\rfigueiredo\Documents\PowerShell\Microsoft.PowerShell_profile.ps1`
 dot-sources `shell\history.ps1`. A restored pane carries
 `WEZTERM_SESSION_HISTORY_KEY` equal to its saved pane id and gets

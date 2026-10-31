@@ -13,16 +13,17 @@ emits the OSC 7 current-directory sequence and prints `PS <path>>`, and nothing
 else. Restoring it stops the dot-source of `shell\history.ps1`, so PSReadLine
 keeps its global history file and per-pane history is off.
 
-The config backup is created by step 13 at
-`C:\Users\rfigueiredo\.wezterm.lua.pre-session-layer.bak`, before the loader is
+The config backup is the copy step 13 made at
+`C:\Users\rfigueiredo\.wezterm.lua.pre-session-layer.bak`, before the loader was
 written. It holds the old config as it was, including its
 `plugin.require("https://github.com/MLFlexer/resurrect.wezterm")` line and the
-old autosave and `gui-startup` handlers. It does not exist until step 13 runs.
+old autosave and `gui-startup` handlers.
 
-Step 14 keeps a dated copy at
-`C:\Users\rfigueiredo\.wezterm.lua.pre-session-layer.2026-10-31.bak`. The two
-files are identical (same SHA256), and step 14 removes neither one. Use the
-dated copy as the rollback source after step 14.
+Step 14 keeps a second copy at
+`C:\Users\rfigueiredo\.wezterm.lua.pre-session-layer.2026-10-31.bak`. Both
+files exist and are identical, with SHA256
+`8F78D95CB2362DB16E58687DAC1135CF3B444FD4B81DDD7BF538BD0EA4B147D8`. Step 14
+removes neither one. Use the dated copy as the rollback source after step 14.
 
 ## The loader that replaces the config
 

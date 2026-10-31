@@ -18,9 +18,13 @@ The schema is version 1. One JSON file per live instance lives at
 "current session" file.
 
 `version` is the integer `1`. `state.validate` rejects any other value, and
-restore logs `restore.version` and falls back rather than reading a file it
-does not understand. State spec: "read and read_latest reject a mismatched
-schema version".
+`read_latest` validates every candidate before returning it, so a wrong or
+future version never reaches the restore path. With no valid file left,
+`on_gui_startup` logs `restore.no_state` and falls back. The `restore.version`
+warning is reachable only by calling `layout.restore` directly with an
+unvalidated state, which is how the fault and layout specs pin it. State spec:
+"read and read_latest reject a mismatched schema version". Fault spec: "a
+schema mismatch logs, shows a failure and opens a maximized fallback".
 
 `saved_at` is Unix seconds. Restore rejects a state older than 604800 seconds
 (seven days) and logs `restore.stale`. State spec: "is_stale compares against
@@ -130,18 +134,22 @@ cwd. It excludes `saved_at` and `instance`, so a save that only touches the
 clock is not a change. It also excludes the foreground program record, which
 the plan's fingerprint definition does not list.
 
-Each second the detector collects the live window, fingerprints it, and writes
-only after the fingerprint has been stable for two seconds. An idle instance
-compares an unchanged fingerprint with its last write and writes nothing, so it
-cannot overwrite another instance's file. The explicit save key writes at once,
-updates the baseline, and shows the save time in the status area. A failed
-write logs `save.failed`, shows ` save failed `, and starts a fresh settle
-window instead of retrying every tick. Save spec: "the debounce writes after
-two stable seconds and not while idle", "collected fingerprints are stable
-until a tracked field changes", "a refused write shows save failed, logs it,
-and a later save replaces the status". Integration scenario `save_timing`
-checks `idle_silent_10s` and `split_saved_within_3s`; `two_instances` checks
-`no_overwrite_idle`.
+By default the detector collects the live window once a second, fingerprints
+it, and writes only after the fingerprint has been stable for two seconds. An
+idle instance compares an unchanged fingerprint with its last write and writes
+nothing, so it cannot overwrite another instance's file. The explicit save key
+writes at once, updates the baseline, and shows the save time in the status
+area. A failed write logs `save.failed`, shows ` save failed `, and starts a
+fresh settle window instead of retrying every tick. Save spec: "the debounce
+writes after two stable seconds and not while idle", "collected fingerprints
+are stable until a tracked field changes", "a refused write shows save failed,
+logs it, and a later save replaces the status". Integration scenario
+`save_timing` checks `idle_silent_3s` and `split_saved_within_3s`;
+`two_instances` checks `no_overwrite_idle`. The integration runner scales the
+detector for scenarios with `WEZTERM_SESSION_SAVE_DEBOUNCE_MS=400` and
+`WEZTERM_SESSION_SAVE_TICK_MS=150`, so three idle seconds is many multiples of
+the 400 ms test debounce. The production defaults stay covered by the unit
+suite.
 
 Only the instance that owns a file writes it, and it writes only when its
 fingerprint changed. A future contributor who adds a periodic unconditional
@@ -204,11 +212,13 @@ splits in plan order with cwd and the history key". The shell suite cases
 
 ## The settle window and a silent clean restore
 
-After restore, `layout.selfcheck` compares every live title, rectangle and pane
-id against the report built from the plan, and compares a pane's cwd only once
-the pane has reported one. Rectangles allow one cell of slack per edge; titles
-must match exactly; a missing pane is a finding. Cwd comparison normalizes
-slashes, case and a trailing separator. Layout spec: "selfcheck accepts a
+After restore, `layout.selfcheck` compares tab titles, each expected pane's
+rectangle and presence, and a pane's cwd once the pane has reported one,
+against the report built from the plan. It matches live panes to expected panes
+by id but does not compare the id as a value, and it does not flag an extra
+live pane that the report does not know about. Rectangles allow one cell of
+slack per edge; titles must match exactly; a missing expected pane is a
+finding. Cwd comparison normalizes slashes, case and a trailing separator. Layout spec: "selfcheck accepts a
 one-cell drift and normalizes cwd URLs", "selfcheck reports a rectangle drift
 beyond one cell", "selfcheck reports a cwd mismatch", "selfcheck reports a
 title mismatch as a tab finding".
