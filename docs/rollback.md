@@ -19,6 +19,11 @@ written. It holds the old config as it was, including its
 `plugin.require("https://github.com/MLFlexer/resurrect.wezterm")` line and the
 old autosave and `gui-startup` handlers. It does not exist until step 13 runs.
 
+Step 14 keeps a dated copy at
+`C:\Users\rfigueiredo\.wezterm.lua.pre-session-layer.2026-10-31.bak`. The two
+files are identical (same SHA256), and step 14 removes neither one. Use the
+dated copy as the rollback source after step 14.
+
 ## The loader that replaces the config
 
 Step 13 replaces `C:\Users\rfigueiredo\.wezterm.lua` with three statements:
@@ -32,7 +37,7 @@ return dofile(root .. "/wezterm.lua")
 The old config comes back with one line:
 
 ```powershell
-Copy-Item 'C:\Users\rfigueiredo\.wezterm.lua.pre-session-layer.bak' 'C:\Users\rfigueiredo\.wezterm.lua' -Force
+Copy-Item 'C:\Users\rfigueiredo\.wezterm.lua.pre-session-layer.2026-10-31.bak' 'C:\Users\rfigueiredo\.wezterm.lua' -Force
 ```
 
 ## Return to the archived plugin setup
@@ -53,14 +58,16 @@ installed.
    ```
 
 4. Delete the state directory as shown below.
-5. If step 14 has run, use the dated copy of the old config that step 14 keeps.
-   Step 14 removes the plugin cache at
-   `C:\Users\rfigueiredo\AppData\Roaming\wezterm\plugins`, so the step 13
-   backup is not enough on its own after that point.
+5. After step 14, restoring the dated copy also requires the plugin again. Step
+   14 removes the resurrect plugin directory under
+   `C:\Users\rfigueiredo\AppData\Roaming\wezterm\plugins`, but the old config
+   still has its `plugin.require` line, and WezTerm re-clones a required plugin
+   on demand. The first old-config launch needs network access and may take
+   longer while the plugin is fetched.
 
 The old config does not need this repository. It loads the archived plugin
-itself, so the repository can stay on disk or be removed once the backups are
-restored.
+itself, re-cloning it from GitHub when the cache is missing, so the repository
+can stay on disk or be removed once the backups are restored.
 
 ## The state directory
 
