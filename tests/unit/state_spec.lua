@@ -92,7 +92,7 @@ local function sample_state(id, saved_at)
         version = state.SCHEMA_VERSION,
         saved_at = saved_at,
         instance = { id = id, started_at = saved_at - 100 },
-        window = { cols = 200, rows = 50, active_tab = 2, active_pane = 7 },
+        window = { cols = 200, rows = 50, active_tab = 2, active_pane = 9 },
         tabs = {
             {
                 title = "editor",
@@ -389,11 +389,31 @@ return {
         run = function(t)
             with_state_dir("active-pane-zero", function()
                 local zero = sample_state("1700000000-00aa01", 1700000000)
+                zero.window.active_tab = 1
                 zero.window.active_pane = 0
+                zero.tabs[1].panes[1].id = 0
                 t.ok(state.validate(zero), "pane id 0 must be accepted")
                 t.ok(state.write(zero), "a state with active pane 0 must be writable")
                 t.eq(state.read(zero.instance.id), zero)
             end)
+        end,
+    },
+    {
+        name = "the active pane id must match a pane in the active tab",
+        run = function(t)
+            local matching = sample_state("1700000000-00aa01", 1700000000)
+            matching.window.active_tab = 1
+            matching.window.active_pane = 7
+            t.ok(state.validate(matching), "a pane id in the active tab must validate")
+
+            local missing = sample_state("1700000000-00aa01", 1700000000)
+            missing.window.active_pane = 999
+            t.eq(state.validate(missing), false, "999 matches no pane")
+
+            local wrong_tab = sample_state("1700000000-00aa01", 1700000000)
+            wrong_tab.window.active_tab = 1
+            wrong_tab.window.active_pane = 9
+            t.eq(state.validate(wrong_tab), false, "pane 9 is in tab 2, not tab 1")
         end,
     },
     {

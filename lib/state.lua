@@ -225,7 +225,8 @@ function M.validate(t)
         return false
     end
     -- active_tab is a one-based position, but active_pane is a pane id and this
-    -- build numbers panes from zero, so 0 is a valid active pane.
+    -- build numbers panes from zero. A non-empty state must point at a pane that
+    -- actually exists in the active tab; an empty state has no pane to match.
     if not is_integer(window.active_pane) or window.active_pane < 0 then
         return false
     end
@@ -235,6 +236,22 @@ function M.validate(t)
     end
     for _, tab in ipairs(t.tabs) do
         if not valid_tab(tab) then
+            return false
+        end
+    end
+    if #t.tabs > 0 then
+        local active_tab = t.tabs[window.active_tab]
+        if active_tab == nil then
+            return false
+        end
+        local found = false
+        for _, pane in ipairs(active_tab.panes) do
+            if pane.id == window.active_pane then
+                found = true
+                break
+            end
+        end
+        if not found then
             return false
         end
     end
