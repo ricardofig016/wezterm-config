@@ -4,15 +4,19 @@
 -- evaluates a config twice per process, so a load-time timer would register
 -- twice. Each tick collects the live window, fingerprints it with
 -- state.fingerprint(), and writes only after the fingerprint has been stable
--- for DEBOUNCE_SECONDS. There is no unconditional periodic write.
+-- for DEBOUNCE_MS. There is no unconditional periodic write.
 local wezterm = require("wezterm")
 local state = require("lib.state")
 local log = require("lib.log")
 
 local M = {}
 
-M.TICK_SECONDS = 1
-M.DEBOUNCE_SECONDS = 2
+M.DEFAULT_TICK_MS = 1000
+M.DEFAULT_DEBOUNCE_MS = 2000
+M.MIN_INTERVAL_MS = 50
+M.MAX_INTERVAL_MS = 60000
+M.TICK_MS = M.DEFAULT_TICK_MS
+M.DEBOUNCE_MS = M.DEFAULT_DEBOUNCE_MS
 M.STATUS_SECONDS = 3
 M.FAILURE_STATUS_SECONDS = 10
 
@@ -28,6 +32,40 @@ local function safe_log(level, event, fields)
     if type(emit) == "function" then
         pcall(emit, event, fields)
     end
+end
+
+local function read_env(name)
+    local ok, value = pcall(os.getenv, name)
+    if ok then
+        return value
+    end
+    return nil
+end
+
+local function interval_ms(name, default)
+    local value = tonumber(read_env(name))
+    if type(value) ~= "number" or value ~= value then
+        return default
+    end
+    if value == math.huge or value == -math.huge then
+        return default
+    end
+    value = math.floor(value)
+    if value < M.MIN_INTERVAL_MS then
+        return M.MIN_INTERVAL_MS
+    end
+    if value > M.MAX_INTERVAL_MS then
+        return M.MAX_INTERVAL_MS
+    end
+    return value
+end
+
+-- Read the test-only interval overrides once, when the detector starts. The
+-- defaults keep production at a one-second tick and a two-second settle.
+function M.configure()
+    M.DEBOUNCE_MS = interval_ms("WEZTERM_SESSION_SAVE_DEBOUNCE_MS", M.DEFAULT_DEBOUNCE_MS)
+    M.TICK_MS = interval_ms("WEZTERM_SESSION_SAVE_TICK_MS", M.DEFAULT_TICK_MS)
+    return { debounce_ms = M.DEBOUNCE_MS, tick_ms = M.TICK_MS }
 end
 
 local function now_seconds()
@@ -287,7 +325,7 @@ function M.decide(last_written, pending_state, current, now, settle_seconds)
     end
 
     now = now or now_seconds()
-    settle_seconds = settle_seconds or M.DEBOUNCE_SECONDS
+    settle_seconds = settle_seconds or (M.DEBOUNCE_MS / 1000)
     if type(pending_state) ~= "table" or pending_state.fingerprint ~= current then
         return false, { fingerprint = current, since = now }
     end
@@ -403,7 +441,7 @@ local function find_window()
 end
 
 local function schedule_next()
-    local ok, err = pcall(wezterm.time.call_after, M.TICK_SECONDS, M.tick)
+    local ok, err = pcall(wezterm.time.call_after, M.TICK_MS / 1000, M.tick)
     if not ok then
         safe_log("error", "save.failed", {
             trigger = "schedule",
@@ -460,6 +498,7 @@ function M.start()
     if started then
         return true
     end
+    M.configure()
     started = true
     instance_started_at()
     if not schedule_next() then

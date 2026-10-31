@@ -133,6 +133,23 @@ local function with_state_dir(name, fn)
     end
 end
 
+local function with_save_env(values, fn)
+    local previous = os.getenv
+    os.getenv = function(name)
+        if name == "WEZTERM_SESSION_SAVE_DEBOUNCE_MS" then
+            return values.debounce
+        elseif name == "WEZTERM_SESSION_SAVE_TICK_MS" then
+            return values.tick
+        end
+        return previous(name)
+    end
+    local ok, err = pcall(fn)
+    os.getenv = previous
+    if not ok then
+        error(err, 0)
+    end
+end
+
 local function with_fake_timers(fn)
     local real_call_after = wezterm.time.call_after
     local timers = {}
@@ -437,7 +454,7 @@ return {
     {
         name = "the debounce writes after two stable seconds and not while idle",
         run = function(t)
-            t.eq(save.DEBOUNCE_SECONDS, 2)
+            t.eq(save.DEBOUNCE_MS, 2000)
 
             local write, pending = save.decide("A", nil, "A", 100)
             t.eq(write, false, "an unchanged fingerprint must not write")
@@ -485,7 +502,7 @@ return {
             local scheduled = 0
             wezterm.time.call_after = function(seconds, fn)
                 scheduled = scheduled + 1
-                t.eq(seconds, save.TICK_SECONDS)
+                t.eq(seconds, save.TICK_MS / 1000)
                 t.ok(type(fn) == "function", "the timer needs a callback")
                 return true
             end
@@ -570,6 +587,67 @@ return {
             local empty_snapshot, empty_err = save.collect(empty)
             t.eq(empty_snapshot, nil)
             t.ok(type(empty_err) == "string" and empty_err ~= "")
+        end,
+    },
+    {
+        name = "save intervals default to 2000 ms debounce and 1000 ms tick",
+        run = function(t)
+            with_save_env({}, function()
+                local intervals = save.configure()
+                t.eq(intervals, { debounce_ms = 2000, tick_ms = 1000 })
+                t.eq(save.DEBOUNCE_MS, save.DEFAULT_DEBOUNCE_MS)
+                t.eq(save.TICK_MS, save.DEFAULT_TICK_MS)
+            end)
+        end,
+    },
+    {
+        name = "save interval environment overrides are honoured",
+        run = function(t)
+            with_save_env({ debounce = "250", tick = "100" }, function()
+                local intervals = save.configure()
+                t.eq(intervals, { debounce_ms = 250, tick_ms = 100 })
+                t.eq(save.DEBOUNCE_MS, 250)
+                t.eq(save.TICK_MS, 100)
+            end)
+        end,
+    },
+    {
+        name = "invalid interval values fall back and out-of-range values clamp",
+        run = function(t)
+            with_save_env({ debounce = "not-a-number", tick = "" }, function()
+                save.configure()
+                t.eq(save.DEBOUNCE_MS, save.DEFAULT_DEBOUNCE_MS)
+                t.eq(save.TICK_MS, save.DEFAULT_TICK_MS)
+            end)
+
+            with_save_env({ debounce = "1", tick = "999999" }, function()
+                save.configure()
+                t.eq(save.DEBOUNCE_MS, save.MIN_INTERVAL_MS)
+                t.eq(save.TICK_MS, save.MAX_INTERVAL_MS)
+            end)
+        end,
+    },
+    {
+        name = "the debounce decision honours a small configured interval",
+        run = function(t)
+            with_save_env({ debounce = "50", tick = "100" }, function()
+                save.configure()
+                local write, pending = save.decide(nil, nil, "A", 0)
+                t.eq(write, false)
+                t.eq(pending, { fingerprint = "A", since = 0 })
+
+                local early = save.decide(nil, pending, "A", 0.049)
+                t.eq(early, false, "less than 50 ms must not write")
+
+                local due = save.decide(nil, pending, "A", 0.051)
+                t.eq(due, true, "more than 50 ms must write")
+            end)
+
+            with_save_env({}, function()
+                save.configure()
+            end)
+            t.eq(save.DEBOUNCE_MS, save.DEFAULT_DEBOUNCE_MS)
+            t.eq(save.TICK_MS, save.DEFAULT_TICK_MS)
         end,
     },
 }
