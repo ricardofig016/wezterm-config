@@ -13,8 +13,8 @@ callbacks. `lib\state.lua` owns schema version 1, one JSON file per instance
 under the state directory, atomic replace, staleness, newest-file selection,
 pruning, and the fingerprint. `lib\layout.lua` owns the split planner, replay,
 restore, and the post-restore self-check. `lib\save.lua` owns the debounced
-change detector and the explicit save key. `lib\history.lua` owns pane identity
-for the shell hook. `lib\log.lua` owns structured log lines and rotation.
+change detector and the explicit save key. `lib\log.lua` owns structured log
+lines and rotation.
 `tests\run.ps1` is the only test runner. `tests\harness\unit.lua` runs the
 headless suite, `tests\unit` holds its specs, `tests\scenarios` holds real-GUI
 scenarios, and `tests\fixtures` holds captured layouts. `shell\` is for the
