@@ -365,6 +365,26 @@ return {
         end,
     },
     {
+        name = "a tab switch alone changes the fingerprint",
+        run = function(t)
+            local before = sample_state("1700000000-00aa01", 1700000000)
+            local switched = sample_state("1700000000-00aa01", 1700000000)
+            switched.window.active_tab = 1
+            t.eq(switched.tabs, before.tabs, "only the active tab may differ")
+            t.ok(
+                state.fingerprint(before) ~= state.fingerprint(switched),
+                "a tab switch must change the fingerprint"
+            )
+
+            local repaned = sample_state("1700000000-00aa01", 1700000000)
+            repaned.window.active_pane = 3
+            t.ok(
+                state.fingerprint(before) ~= state.fingerprint(repaned),
+                "a pane switch must change the fingerprint"
+            )
+        end,
+    },
+    {
         name = "the logger stays inert until init is called",
         run = function(t)
             t.eq(log.info("save.tick", {}), false, "a logger without init must not write")

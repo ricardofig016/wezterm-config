@@ -284,7 +284,8 @@ end
 
 -- Stable across a save that only changes saved_at (and instance), so the
 -- change detector can compare fingerprints instead of tables. Covers the
--- window cell size plus every tab title, pane id, rectangle and cwd.
+-- window cell size with its active tab and pane, plus every tab title, pane
+-- id, rectangle and cwd.
 function M.fingerprint(t)
     if type(t) ~= "table" then
         return ""
@@ -292,7 +293,13 @@ function M.fingerprint(t)
     local parts = { "v=" .. tostring(t.version) }
     local window = t.window
     if type(window) == "table" then
-        parts[#parts + 1] = string.format("w=%s,%s", tostring(window.cols), tostring(window.rows))
+        parts[#parts + 1] = string.format(
+            "w=%s,%s,%s,%s",
+            tostring(window.cols),
+            tostring(window.rows),
+            tostring(window.active_tab),
+            tostring(window.active_pane)
+        )
     end
     if type(t.tabs) == "table" then
         for tab_index, tab in ipairs(t.tabs) do
