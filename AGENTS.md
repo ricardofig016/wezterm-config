@@ -47,5 +47,7 @@ explicit paths one at a time; `git add -A` and `git add .` are banned. Commit
 only when the covering check is green, and never commit while the suite is red
 for a reason outside your area. Use `<type>(<area>): <summary>` with type
 `feat`, `fix`, `test`, `docs`, or `chore`, and area `entry`, `state`, `layout`,
-`save`, `history`, `proof`, `docs`, or `repo`. No commit mixes areas. Editor
-temp files, test reports, and state directories never enter a commit.
+`save`, `history`, `proof`, `docs`, `repo`, `selfcheck`, or `log`. `selfcheck`
+covers the runtime layout verification inside `lib\layout.lua`. `log` covers
+the structured logger in `lib\log.lua`. No commit mixes areas. Editor temp
+files, test reports, and state directories never enter a commit.
