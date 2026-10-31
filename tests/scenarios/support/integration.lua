@@ -178,5 +178,272 @@ function M.write(report_path, checks, extra)
     end
     return true
 end
+-- ---------------------------------------------------------------------------
+-- File, log and window helpers shared by the restore and save scenarios.
+-- ---------------------------------------------------------------------------
+
+function M.file_exists(path)
+    local handle = io.open(path, "r")
+    if handle then
+        handle:close()
+        return true
+    end
+    return false
+end
+
+function M.read_text(path)
+    local handle = io.open(path, "r")
+    if not handle then
+        return nil
+    end
+    local data = handle:read("*a")
+    handle:close()
+    return data
+end
+
+function M.write_text(path, body)
+    local handle, err = io.open(path, "w")
+    if not handle then
+        return false, tostring(err)
+    end
+    local ok, write_err = pcall(function()
+        handle:write(body)
+        handle:flush()
+        handle:close()
+    end)
+    if not ok then
+        pcall(function()
+            handle:close()
+        end)
+        return false, tostring(write_err)
+    end
+    return true
+end
+
+-- The scenario's isolated state directory, derived from the report path the
+-- runner passed rather than trusted from the environment.
+function M.state_dir(report_path)
+    return M.dirname(report_path) .. "/state"
+end
+
+function M.scenario_dir(report_path)
+    return M.dirname(report_path)
+end
+
+function M.sessions_dir(report_path)
+    return M.state_dir(report_path) .. "/sessions"
+end
+
+-- Names (not paths) of the valid-looking session files, sorted. Validity is the
+-- caller's job: this only filters the .json suffix.
+function M.session_names(report_path)
+    local names = {}
+    local ok, entries = pcall(wezterm.read_dir, M.sessions_dir(report_path))
+    if not ok or type(entries) ~= "table" then
+        return names
+    end
+    for _, entry in ipairs(entries) do
+        local text = tostring(entry)
+        local name = text:match("([^\\/]+)$") or text
+        if name:sub(-5) == ".json" then
+            names[#names + 1] = name
+        end
+    end
+    table.sort(names)
+    return names
+end
+
+-- Parse lib\log.lua's one-line format. Returns entries with level, event and
+-- the raw line so a failure can quote what the log actually said.
+function M.log_lines(report_path)
+    local text = M.read_text(M.state_dir(report_path) .. "/session.log")
+    local lines = {}
+    if text == nil then
+        return lines
+    end
+    for line in text:gmatch("[^\r\n]+") do
+        local level = line:match(" level=([%w]+)")
+        local event = line:match(" event=([%w_%.]+)")
+        if event ~= nil then
+            lines[#lines + 1] = { level = level, event = event, line = line }
+        end
+    end
+    return lines
+end
+
+function M.find_log_event(report_path, event, level)
+    for _, entry in ipairs(M.log_lines(report_path)) do
+        if entry.event == event and (level == nil or entry.level == level) then
+            return true, entry.line
+        end
+    end
+    return false, "no log line for event " .. tostring(event)
+end
+
+function M.add_log_check(add, report_path, name, event, level)
+    local found, line = M.find_log_event(report_path, event, level)
+    add(name, found, found and line or ("missing event " .. tostring(event)))
+end
+
+function M.add_log_absent(add, report_path, name, events)
+    local found = {}
+    for _, entry in ipairs(M.log_lines(report_path)) do
+        for _, event in ipairs(events) do
+            if entry.event == event then
+                found[#found + 1] = entry.line
+            end
+        end
+    end
+    add(name, #found == 0,
+        #found == 0 and "none present" or table.concat(found, " | "))
+end
+
+function M.pane_signature(panes)
+    local parts = {}
+    for _, info in ipairs(panes) do
+        parts[#parts + 1] = string.format(
+            "%s,%s,%s,%s,%s,%s",
+            tostring(info.left),
+            tostring(info.top),
+            tostring(info.width),
+            tostring(info.height),
+            tostring(info.pixel_width),
+            tostring(info.pixel_height)
+        )
+    end
+    return table.concat(parts, ";")
+end
+
+-- Poll for the first window and tab, then hand both to on_ready.
+function M.await_window(timeout_seconds, on_ready, on_timeout)
+    local deadline = os.time() + (timeout_seconds or 8)
+    local function tick()
+        local ok, windows = pcall(wezterm.mux.all_windows)
+        if ok and type(windows) == "table" and #windows > 0 then
+            local tabs = windows[1]:tabs()
+            if tabs and #tabs > 0 then
+                on_ready(windows[1], tabs[1])
+                return
+            end
+        end
+        if os.time() >= deadline then
+            on_timeout("no window or tab within " .. tostring(timeout_seconds or 8) .. "s")
+            return
+        end
+        wezterm.time.call_after(0.1, tick)
+    end
+    wezterm.time.call_after(0.1, tick)
+end
+
+-- Poll until the pane list is non-empty and identical on two consecutive
+-- reads, then hand the settled list to on_ready. A maximized fallback changes
+-- the grid after the window first appears, so no scenario may measure the
+-- first read.
+function M.settle(tab, timeout_seconds, on_ready, on_timeout)
+    local deadline = os.time() + (timeout_seconds or 8)
+    local last = nil
+    local stable = 0
+    local function tick()
+        local ok, infos = pcall(tab.panes_with_info, tab)
+        if not ok then
+            on_timeout("tab:panes_with_info() failed: " .. tostring(infos))
+            return
+        end
+        if type(infos) ~= "table" or #infos == 0 then
+            if os.time() >= deadline then
+                on_timeout("tab has no panes")
+                return
+            end
+            wezterm.time.call_after(0.1, tick)
+            return
+        end
+        local signature = M.pane_signature(infos)
+        if signature == last then
+            stable = stable + 1
+        else
+            stable = 0
+        end
+        last = signature
+        if stable >= 2 or os.time() >= deadline then
+            on_ready(infos)
+            return
+        end
+        wezterm.time.call_after(0.1, tick)
+    end
+    wezterm.time.call_after(0.1, tick)
+end
+
+M.FALLBACK_COLS = 120
+M.FALLBACK_ROWS = 35
+
+-- Chrome (title bar, tab bar, taskbar) sits between the pane and the screen. On
+-- this 1920x1200 screen the maximized pane measured 1900x1012, so 250 px of
+-- slack accepts the real chrome while rejecting a plain 120x35 window, which
+-- leaves about 720x430 px.
+M.SCREEN_TOLERANCE_PX = 250
+
+-- Assert the intended fallback shape: exactly one pane at the tab origin, at
+-- least the configured 120x35 cells, and pixels within chrome of the primary
+-- screen. Returns true when every check passed.
+function M.check_maximized_fallback(add, infos)
+    local all_ok = true
+    add("pane_count", #infos == 1, "panes=" .. tostring(#infos))
+    if #infos ~= 1 then
+        all_ok = false
+    end
+
+    local first = infos[1]
+    if first == nil then
+        add("first_pane_rect", false, "tab:panes_with_info() returned no panes")
+        add("maximized_pixels", false, "tab:panes_with_info() returned no panes")
+        return false
+    end
+
+    local width = tonumber(first.width) or -1
+    local height = tonumber(first.height) or -1
+    local cells_ok = first.left == 0
+        and first.top == 0
+        and width >= M.FALLBACK_COLS
+        and height >= M.FALLBACK_ROWS
+    add("first_pane_rect", cells_ok,
+        string.format("left=%s top=%s width=%s height=%s (expected 0,0 and at least %dx%d)",
+            tostring(first.left), tostring(first.top), tostring(width), tostring(height),
+            M.FALLBACK_COLS, M.FALLBACK_ROWS))
+    if not cells_ok then
+        all_ok = false
+    end
+
+    local screens_ok, screens = pcall(wezterm.gui.screens)
+    local screen = nil
+    if screens_ok and type(screens) == "table" then
+        screen = screens.main or screens.active or screens[1]
+    end
+    if type(screen) ~= "table" then
+        add("maximized_pixels", false,
+            "wezterm.gui.screens() returned no primary screen: " .. tostring(screens))
+        return false
+    end
+
+    local pixel_width = tonumber(first.pixel_width) or -1
+    local pixel_height = tonumber(first.pixel_height) or -1
+    local screen_width = tonumber(screen.width) or -1
+    local screen_height = tonumber(screen.height) or -1
+    local width_slack = screen_width - pixel_width
+    local height_slack = screen_height - pixel_height
+    local pixels_ok = pixel_width > 0
+        and pixel_height > 0
+        and width_slack >= 0
+        and height_slack >= 0
+        and width_slack <= M.SCREEN_TOLERANCE_PX
+        and height_slack <= M.SCREEN_TOLERANCE_PX
+    add("maximized_pixels", pixels_ok,
+        string.format("pane=%dx%d px screen=%dx%d px slack=%dx%d px tolerance=%d px",
+            pixel_width, pixel_height, screen_width, screen_height,
+            width_slack, height_slack, M.SCREEN_TOLERANCE_PX))
+    if not pixels_ok then
+        all_ok = false
+    end
+    return all_ok
+end
 
 return M

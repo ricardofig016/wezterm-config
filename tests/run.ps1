@@ -424,6 +424,24 @@ function Invoke-IntegrationScenario {
             # attributed to this launch before anything is killed.
             $created = Get-CreatedGuiPids -Before $before -StartedPid $started.Id
             $owned = @($created.Owned)
+
+            # A scenario may launch a peer wezterm-gui of its own (the
+            # two-instance scenario does). It records the pids in
+            # <scenario>\.owned-pids, and the runner accepts only pids that are
+            # new GUI processes since the before snapshot, so a scenario can
+            # never make this run kill a process it did not start.
+            $ownedPidsPath = Join-Path $scenarioDir '.owned-pids'
+            if (Test-Path -LiteralPath $ownedPidsPath) {
+                foreach ($raw in @(Get-Content -LiteralPath $ownedPidsPath -ErrorAction SilentlyContinue)) {
+                    $declaredPid = 0
+                    if ([int]::TryParse(([string]$raw).Trim(), [ref]$declaredPid)) {
+                        if ($declaredPid -gt 0 -and $created.New -contains $declaredPid -and $owned -notcontains $declaredPid) {
+                            $owned = @($owned + $declaredPid)
+                        }
+                    }
+                }
+            }
+
             if (-not $created.StartedAlive -and $null -eq $failureReason) {
                 $failureReason = "process $($started.Id) exited before the runner killed it"
             }
@@ -484,6 +502,19 @@ function Invoke-IntegrationScenario {
         $detail = ($check.Detail -replace '\r?\n', ' ')
         Write-Output ('  check {0} :: {1}' -f $check.Name, $detail)
     }
+
+    # Scenarios assert on the structured log themselves; printing its tail here
+    # makes a red run diagnosable without opening the artifacts by hand.
+    $logPath = Join-Path $stateDir 'session.log'
+    if (Test-Path -LiteralPath $logPath) {
+        $logLines = @(Get-Content -LiteralPath $logPath -Tail 15 -ErrorAction SilentlyContinue)
+        if ($logLines.Count -gt 0) {
+            Write-Output '  session.log (tail):'
+            foreach ($line in $logLines) {
+                Write-Output ('    ' + $line)
+            }
+        }
+    }
     $script:scenarioPassed = $false
 }
 
@@ -512,7 +543,9 @@ function Invoke-IntegrationSuite {
     $runRoot = Join-Path $env:TEMP ('wezterm-session-layer-it-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
 
-    $timeoutSeconds = 25
+    # Long enough for the save-timing scenario's expected baseline write, ten
+    # seconds of idle silence and a split save, with headroom for a slow shell.
+    $timeoutSeconds = 40
     $failed = 0
     try {
         foreach ($scenarioFile in $scenarioFiles) {
