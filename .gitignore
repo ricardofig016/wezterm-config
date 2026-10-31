@@ -1,0 +1,20 @@
+# Runtime state. The layer normally writes under
+# %APPDATA%\wezterm-session-layer: one sessions\<instance>.json per live
+# instance plus a rotated session.log. WEZTERM_SESSION_STATE_DIR can point the
+# state directory into the tree, so ignore it by name.
+wezterm-session-layer/
+session.log.*
+
+# Logs and scratch files.
+*.log
+*.TMP
+*~
+
+# The unit runner deletes and rewrites this file; it is a pass signal, not
+# source.
+tests/.report.json
+
+# Integration runs keep isolated state under a %TEMP% root named
+# wezterm-session-layer-it-<id>. If a failed run's artifacts are copied into
+# the tree, keep them out.
+wezterm-session-layer-it-*/
