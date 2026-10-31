@@ -54,9 +54,10 @@ local seeded = {
                 {
                     id = 2,
                     rect = { left = 80, top = 0, width = 40, height = 35 },
-                    -- A valid state shape whose cwd cannot come back from a
-                    -- live pane, so the restore's own self-check sees drift.
-                    cwd = "",
+                    -- A directory that does not exist. The split cannot apply
+                    -- it, so the pane starts elsewhere and reports that other
+                    -- path: a genuine reported mismatch, not an unknown cwd.
+                    cwd = "C:/Users/rfigueiredo/wezterm-session-layer-missing-dir",
                 },
             },
         },
@@ -214,12 +215,15 @@ wezterm.on("gui-startup", function(_cmd)
                 local found, line = support.find_log_event(report_path, "selfcheck.drift", "warn")
                 if found then
                     add("log_drift", true, line)
+                    add("drift_timed_out", line:find("timed_out=true", 1, true) ~= nil, line)
                     after_drift()
                     return
                 end
-                if drift_polls > 80 then
+                -- The fixed self-check waits up to ten seconds for the shells to
+                -- report cwd, so poll past that window before declaring failure.
+                if drift_polls > 160 then
                     add("log_drift", false,
-                        "no selfcheck.drift within 8s (artifacts: "
+                        "no selfcheck.drift within 16s (artifacts: "
                             .. support.scenario_dir(report_path) .. ")")
                     after_drift()
                     return
