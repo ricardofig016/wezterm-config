@@ -835,6 +835,15 @@ function M.on_gui_startup(cmd)
         log.error("restore.failed", { error = tostring(err) })
         fallback(cmd)
     end
+
+    -- Stale instance files otherwise accumulate forever. Prune once per
+    -- startup, after the restore attempt, and never let it break startup.
+    local pruned_ok, pruned = pcall(state.prune, os.time())
+    if pruned_ok then
+        log.info("restore.pruned", { removed = tonumber(pruned) or 0 })
+    else
+        log.warn("restore.prune_failed", { error = tostring(pruned) })
+    end
     return true
 end
 

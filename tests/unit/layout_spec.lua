@@ -1572,4 +1572,71 @@ return {
             end)
         end,
     },
+    {
+        name = "startup prunes stale state once and logs the count",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                local prune_calls = 0
+                local saw_window = false
+                local saw_clock = false
+                with_stub(state, "prune", function(now)
+                    prune_calls = prune_calls + 1
+                    saw_window = env.spawn ~= nil
+                    saw_clock = type(now) == "number"
+                    return 3
+                end, function()
+                    with_stub(state, "read_latest", function()
+                        return nil
+                    end, function()
+                        t.eq(layout.on_gui_startup(nil), true)
+                    end)
+                end)
+                t.eq(prune_calls, 1, "prune must run exactly once per startup")
+                t.ok(saw_window, "prune must run after the restore attempt")
+                t.ok(saw_clock, "prune must receive a clock")
+                local pruned = find_event(events, "restore.pruned")
+                t.ok(pruned ~= nil)
+                t.eq(pruned.fields.removed, 3)
+            end)
+        end,
+    },
+    {
+        name = "startup logs a zero prune count when nothing is stale",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                with_stub(state, "prune", function()
+                    return 0
+                end, function()
+                    with_stub(state, "read_latest", function()
+                        return nil
+                    end, function()
+                        t.eq(layout.on_gui_startup(nil), true)
+                    end)
+                end)
+                local pruned = find_event(events, "restore.pruned")
+                t.ok(pruned ~= nil)
+                t.eq(pruned.fields.removed, 0)
+            end)
+        end,
+    },
+    {
+        name = "a prune failure is logged and never breaks startup",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                with_stub(state, "prune", function()
+                    error("disk went away")
+                end, function()
+                    with_stub(state, "read_latest", function()
+                        return nil
+                    end, function()
+                        t.eq(layout.on_gui_startup(nil), true)
+                    end)
+                end)
+                local failed = find_event(events, "restore.prune_failed")
+                t.ok(failed ~= nil)
+                t.ok(failed.fields.error:find("disk went away", 1, true) ~= nil)
+                t.ok(env.spawn ~= nil, "the fallback window must still exist")
+            end)
+        end,
+    },
 }
