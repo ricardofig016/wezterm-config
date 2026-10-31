@@ -390,6 +390,44 @@ local function existing_window()
     return last
 end
 
+local STATUS_CLEAR_SECONDS = 4
+local SELFCHECK_KINDS_SHOWN = 3
+
+-- Status and timer calls are best effort: a missing status area, a closed
+-- window or an odd clock must never turn a self-check or a fallback into a
+-- crash, and a self-check problem must never cause another fallback.
+local function set_status(window, text)
+    if window == nil then
+        return false
+    end
+    return pcall(function()
+        window:gui_window():set_right_status(text)
+    end)
+end
+
+local function flash_status(window, text)
+    if not set_status(window, text) then
+        return false
+    end
+    pcall(function()
+        wezterm.time.call_after(STATUS_CLEAR_SECONDS, function()
+            set_status(window, "")
+        end)
+    end)
+    return true
+end
+
+local function summarize_findings(findings)
+    local kinds, seen = {}, {}
+    for _, finding in ipairs(findings) do
+        if not seen[finding.kind] and #kinds < SELFCHECK_KINDS_SHOWN then
+            seen[finding.kind] = true
+            kinds[#kinds + 1] = finding.kind
+        end
+    end
+    return table.concat(kinds, ",")
+end
+
 -- Fallback: keep exactly one usable window. A partially restored window is
 -- maximized rather than replaced, so a failure never leaves the user with no
 -- terminal or with two windows.
@@ -397,6 +435,7 @@ local function fallback(cmd)
     local window = existing_window()
     if window ~= nil then
         maximize(window)
+        flash_status(window, " restore failed ")
         return false
     end
 
@@ -406,6 +445,7 @@ local function fallback(cmd)
         return false
     end
     maximize(spawned)
+    flash_status(spawned, " restore failed ")
     return false
 end
 
@@ -587,6 +627,7 @@ function M.restore(cmd, latest)
     if not built then
         log.error("restore.failed", { error = tostring(build_err) })
         maximize(window)
+        flash_status(window, " restore failed ")
         return false
     end
 
@@ -628,6 +669,45 @@ function M.restore(cmd, latest)
         pcall(active_pane_object.activate, active_pane_object)
     end
 
+    local report = { tabs = {} }
+    for tab_index, plan in ipairs(plans) do
+        local expected_tab = {
+            tab = tab_objects[tab_index],
+            title = plan.saved.title,
+            panes = {},
+        }
+        for leaf, saved_pane in ipairs(plan.saved.panes) do
+            expected_tab.panes[leaf] = {
+                id = saved_pane.id,
+                rect = saved_pane.rect,
+                cwd = saved_pane.cwd,
+                pane = plan.by_leaf[leaf],
+            }
+        end
+        report.tabs[tab_index] = expected_tab
+    end
+
+    -- A self-check problem is logged but never escalates into a fallback: the
+    -- layout is already usable and a broken status area must not lose it.
+    local checked, findings = pcall(M.selfcheck, report)
+    if not checked then
+        log.warn("selfcheck.failed", { error = tostring(findings) })
+    elseif type(findings) == "table" and #findings > 0 then
+        local first = findings[1]
+        local fields = {
+            count = #findings,
+            kinds = summarize_findings(findings),
+            tab = first.tab,
+        }
+        if first.pane ~= nil then
+            fields.pane = first.pane
+        end
+        log.warn("selfcheck.drift", fields)
+        if not flash_status(window, " restore drift: " .. tostring(#findings) .. " ") then
+            log.warn("selfcheck.status_failed")
+        end
+    end
+
     log.info("restore.done", { tabs = tab_count, active_tab = active_tab })
     return true
 end
@@ -653,8 +733,126 @@ function M.on_gui_startup(cmd)
     return true
 end
 
-function M.selfcheck(report)
+local function pane_id_of(pane)
+    if pane == nil then
+        return nil
+    end
+    local ok, id = pcall(function()
+        return pane:pane_id()
+    end)
+    if ok then
+        return id
+    end
     return nil
+end
+
+-- Compare a live cwd URL with the saved path. Windows cwds arrive as
+-- /C:/Users/... from the Url and as C:\Users\... from the state, so normalise
+-- both to backslashes and lower case; a trailing separator is significant and
+-- left alone.
+local function normalize_cwd(value)
+    if value == nil then
+        return nil
+    end
+    local text
+    if type(value) == "table" then
+        text = value.file_path or value.path
+    end
+    if type(text) ~= "string" then
+        text = tostring(value)
+    end
+    text = text:gsub("^/([%a]):", "%1:")
+    text = text:gsub("/", "\\")
+    return text:lower()
+end
+
+-- One cell of slack on every rectangle edge absorbs rounding, not a real
+-- layout change.
+local function rect_drifts(live, expected)
+    for _, edge in ipairs({ "left", "top", "width", "height" }) do
+        local want = expected[edge]
+        local got = live[edge]
+        if type(want) ~= "number" or type(got) ~= "number" then
+            return true
+        end
+        if math.abs(got - want) > 1 then
+            return true
+        end
+    end
+    return false
+end
+
+-- Compare the live tabs and panes against the report restore built from the
+-- plan. Returns an array of { kind, tab, pane } findings (pane is absent for a
+-- tab-level title finding) and never raises for a missing or odd live value.
+function M.selfcheck(report)
+    local findings = {}
+    if type(report) ~= "table" or type(report.tabs) ~= "table" then
+        return findings
+    end
+
+    for tab_index, expected_tab in ipairs(report.tabs) do
+        local tab = expected_tab.tab
+        local live_title
+        if tab ~= nil then
+            local ok, title = pcall(tab.get_title, tab)
+            if ok then
+                live_title = title
+            end
+        end
+        if type(expected_tab.title) == "string" and live_title ~= expected_tab.title then
+            findings[#findings + 1] = { kind = "title", tab = tab_index }
+        end
+
+        local live_by_id = {}
+        if tab ~= nil then
+            local ok, infos = pcall(tab.panes_with_info, tab)
+            if ok and type(infos) == "table" then
+                for _, info in ipairs(infos) do
+                    local id = pane_id_of(info.pane)
+                    if id ~= nil then
+                        live_by_id[id] = info
+                    end
+                end
+            end
+        end
+
+        for _, expected_pane in ipairs(expected_tab.panes or {}) do
+            local live = live_by_id[pane_id_of(expected_pane.pane)]
+            if live == nil then
+                findings[#findings + 1] = {
+                    kind = "missing_pane",
+                    tab = tab_index,
+                    pane = expected_pane.id,
+                }
+            else
+                if rect_drifts(live, expected_pane.rect or {}) then
+                    findings[#findings + 1] = {
+                        kind = "rect",
+                        tab = tab_index,
+                        pane = expected_pane.id,
+                    }
+                end
+
+                local live_cwd
+                if expected_pane.pane ~= nil then
+                    local ok, url = pcall(expected_pane.pane.get_current_working_dir, expected_pane.pane)
+                    if ok then
+                        live_cwd = url
+                    end
+                end
+                if normalize_cwd(live_cwd) ~= normalize_cwd(expected_pane.cwd) then
+                    findings[#findings + 1] = {
+                        kind = "cwd",
+                        tab = tab_index,
+                        pane = expected_pane.id,
+                    }
+                end
+            end
+        end
+    end
+
+    return findings
 end
 
 return M

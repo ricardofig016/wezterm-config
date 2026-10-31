@@ -269,7 +269,7 @@ local function new_fake_env(options)
     end
 
     local function make_window()
-        local window = { maximized = 0, spawn_tab_calls = {} }
+        local window = { maximized = 0, spawn_tab_calls = {}, statuses = {} }
         function window:spawn_tab(args)
             local tab = make_tab()
             local pane = make_pane()
@@ -280,9 +280,15 @@ local function new_fake_env(options)
             return tab, pane, window
         end
         function window:gui_window()
+            if env.status_raises then
+                error("no status area")
+            end
             return {
                 maximize = function()
                     window.maximized = window.maximized + 1
+                end,
+                set_right_status = function(_, text)
+                    window.statuses[#window.statuses + 1] = text
                 end,
             }
         end
@@ -406,6 +412,57 @@ local function sample_restore_state(overrides)
         base[key] = value
     end
     return base
+end
+
+-- A hand-built report for selfcheck: each pane entry names its expected rect
+-- and cwd plus optional live values, and the tab answers get_title and
+-- panes_with_info the way a real MuxTab would.
+local function fake_selfcheck_report(tabs)
+    local report = { tabs = {} }
+    for tab_index, tab_spec in ipairs(tabs) do
+        local infos, panes = {}, {}
+        for pane_index, pane_spec in ipairs(tab_spec.panes) do
+            local url = pane_spec.live_url
+            if url == nil then
+                url = { file_path = pane_spec.cwd }
+            end
+            local pane = {
+                pane_id = function()
+                    return pane_spec.id
+                end,
+                get_current_working_dir = function()
+                    return url
+                end,
+            }
+            panes[pane_index] = {
+                id = pane_spec.id,
+                rect = pane_spec.rect,
+                cwd = pane_spec.cwd,
+                pane = pane,
+            }
+            local rect = pane_spec.live_rect or pane_spec.rect
+            infos[pane_index] = {
+                pane = pane,
+                left = rect.left,
+                top = rect.top,
+                width = rect.width,
+                height = rect.height,
+            }
+        end
+        report.tabs[tab_index] = {
+            tab = {
+                get_title = function()
+                    return tab_spec.live_title or tab_spec.title
+                end,
+                panes_with_info = function()
+                    return infos
+                end,
+            },
+            title = tab_spec.title,
+            panes = panes,
+        }
+    end
+    return report
 end
 
 return {
@@ -783,6 +840,7 @@ return {
                 t.eq(env.spawn.args.width, nil, "the fallback must not reuse saved cells")
                 t.eq(env.spawn.args.height, nil)
                 t.eq(env.spawn.window.maximized, 1)
+                t.eq(env.spawn.window.statuses, { " restore failed ", "" })
                 t.eq(#env.spawned_tabs, 0)
                 t.ok(find_event(events, "restore.no_state") ~= nil)
             end)
@@ -989,6 +1047,179 @@ return {
                 t.ok(find_event(events, "restore.failed") ~= nil)
                 t.ok(env.spawn ~= nil, "the fallback must still open a window")
                 t.eq(env.spawn.window.maximized, 1)
+            end)
+        end,
+    },
+    {
+        name = "selfcheck accepts a one-cell drift and normalizes cwd URLs",
+        run = function(t)
+            local report = fake_selfcheck_report({
+                {
+                    title = "editor",
+                    panes = {
+                        {
+                            id = 11,
+                            rect = { left = 0, top = 0, width = 100, height = 50 },
+                            live_rect = { left = 1, top = 0, width = 99, height = 50 },
+                            cwd = "C:\\a",
+                            live_url = { file_path = "/C:/a" },
+                        },
+                    },
+                },
+            })
+            t.eq(layout.selfcheck(report), {})
+        end,
+    },
+    {
+        name = "selfcheck reports a rectangle drift beyond one cell",
+        run = function(t)
+            local report = fake_selfcheck_report({
+                {
+                    title = "editor",
+                    panes = {
+                        {
+                            id = 11,
+                            rect = { left = 0, top = 0, width = 100, height = 50 },
+                            live_rect = { left = 2, top = 0, width = 98, height = 50 },
+                            cwd = "C:\\a",
+                        },
+                    },
+                },
+            })
+            t.eq(layout.selfcheck(report), {
+                { kind = "rect", tab = 1, pane = 11 },
+            })
+        end,
+    },
+    {
+        name = "selfcheck reports a cwd mismatch",
+        run = function(t)
+            local report = fake_selfcheck_report({
+                {
+                    title = "editor",
+                    panes = {
+                        {
+                            id = 11,
+                            rect = { left = 0, top = 0, width = 100, height = 50 },
+                            cwd = "C:\\a",
+                            live_url = { file_path = "/C:/elsewhere" },
+                        },
+                    },
+                },
+            })
+            t.eq(layout.selfcheck(report), {
+                { kind = "cwd", tab = 1, pane = 11 },
+            })
+        end,
+    },
+    {
+        name = "selfcheck reports a title mismatch as a tab finding",
+        run = function(t)
+            local report = fake_selfcheck_report({
+                {
+                    title = "editor",
+                    live_title = "renamed",
+                    panes = {
+                        {
+                            id = 11,
+                            rect = { left = 0, top = 0, width = 100, height = 50 },
+                            cwd = "C:\\a",
+                        },
+                    },
+                },
+            })
+            t.eq(layout.selfcheck(report), {
+                { kind = "title", tab = 1 },
+            })
+        end,
+    },
+    {
+        name = "a drifting restore logs and flashes a short status",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                with_stub(layout, "selfcheck", function()
+                    return {
+                        { kind = "rect", tab = 1, pane = 10 },
+                        { kind = "cwd", tab = 2, pane = 21 },
+                    }
+                end, function()
+                    t.eq(layout.restore(nil, sample_restore_state()), true)
+                end)
+                t.eq(env.spawn.window.statuses, { " restore drift: 2 ", "" })
+                local drift = find_event(events, "selfcheck.drift")
+                t.ok(drift ~= nil, "the drift must be logged")
+                t.eq(drift.level, "warn")
+                t.eq(drift.fields.count, 2)
+                t.eq(drift.fields.kinds, "rect,cwd")
+                t.eq(drift.fields.tab, 1)
+                t.eq(drift.fields.pane, 10)
+                t.ok(find_event(events, "restore.done") ~= nil)
+            end)
+        end,
+    },
+    {
+        name = "a clean restore stays quiet",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                with_stub(layout, "selfcheck", function()
+                    return {}
+                end, function()
+                    t.eq(layout.restore(nil, sample_restore_state()), true)
+                end)
+                t.eq(env.spawn.window.statuses, {})
+                t.eq(find_event(events, "selfcheck.drift"), nil)
+                t.eq(find_event(events, "selfcheck.failed"), nil)
+            end)
+        end,
+    },
+    {
+        name = "a self-check error is logged and never falls back",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                with_stub(layout, "selfcheck", function()
+                    error("check exploded")
+                end, function()
+                    t.eq(layout.restore(nil, sample_restore_state()), true)
+                end)
+                t.eq(env.spawn.window.statuses, {})
+                t.eq(#env.windows, 1, "a self-check error must not open or duplicate a window")
+                local failed = find_event(events, "selfcheck.failed")
+                t.ok(failed ~= nil)
+                t.ok(failed.fields.error:find("check exploded", 1, true) ~= nil)
+                t.eq(find_event(events, "selfcheck.drift"), nil)
+            end)
+        end,
+    },
+    {
+        name = "a missing status area cannot break a restore",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                env.status_raises = true
+                with_stub(layout, "selfcheck", function()
+                    return { { kind = "rect", tab = 1, pane = 10 } }
+                end, function()
+                    t.eq(layout.restore(nil, sample_restore_state()), true)
+                end)
+                t.eq(#env.windows, 1)
+                t.eq(env.spawn.window.statuses, {})
+                t.ok(find_event(events, "selfcheck.status_failed") ~= nil)
+            end)
+        end,
+    },
+    {
+        name = "an odd clock cannot break a restore",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                with_stub(layout, "selfcheck", function()
+                    return { { kind = "rect", tab = 1, pane = 10 } }
+                end, function()
+                    wezterm.time.call_after = function()
+                        error("no clock")
+                    end
+                    t.eq(layout.restore(nil, sample_restore_state()), true)
+                end)
+                t.eq(env.spawn.window.statuses, { " restore drift: 1 " })
+                t.eq(#env.windows, 1)
             end)
         end,
     },
