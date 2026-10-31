@@ -802,16 +802,47 @@ function Acquire-RunLock {
                     Message = "run lock $Path exists but cannot be read; another run may be starting. Delete it if it is stale."
                 }
             }
-            $existing = $existingText | ConvertFrom-Json
-            $otherPid = 0
-            $parsed = [int]::TryParse([string]$existing.pid, [ref]$otherPid)
-            $alive = $false
-            if ($parsed) {
-                $other = Get-Process -Id $otherPid -ErrorAction SilentlyContinue
-                if ($null -ne $other -and @('pwsh', 'powershell') -contains $other.ProcessName) {
-                    $alive = $true
+
+            $existing = $null
+            $parsedFile = $false
+            if (-not [string]::IsNullOrWhiteSpace($existingText)) {
+                try {
+                    $existing = $existingText | ConvertFrom-Json -ErrorAction Stop
+                    $parsedFile = $true
+                } catch {
+                    $parsedFile = $false
                 }
             }
+
+            $otherPid = 0
+            $alive = $false
+            if ($parsedFile) {
+                $parsed = [int]::TryParse([string]$existing.pid, [ref]$otherPid)
+                if ($parsed) {
+                    $other = Get-Process -Id $otherPid -ErrorAction SilentlyContinue
+                    if ($null -ne $other -and @('pwsh', 'powershell') -contains $other.ProcessName) {
+                        $alive = $true
+                    }
+                }
+            } else {
+                # Empty or damaged: salvage a pid from the raw text. A live owner
+                # still wins and is named; otherwise the lock is stale. This runs
+                # under ErrorActionPreference Stop, so parsing must never throw
+                # out of the runner.
+                $match = [regex]::Match([string]$existingText, '"pid"\s*:\s*(\d+)')
+                if ($match.Success) {
+                    $otherPid = [int]$match.Groups[1].Value
+                    $other = Get-Process -Id $otherPid -ErrorAction SilentlyContinue
+                    if ($null -ne $other -and @('pwsh', 'powershell') -contains $other.ProcessName) {
+                        return [pscustomobject]@{
+                            Stream = $null
+                            Message = ("run lock {0} is damaged but its owner pid {1} is alive; refusing to interleave" -f `
+                                    $Path, $otherPid)
+                        }
+                    }
+                }
+            }
+
             if ($alive) {
                 return [pscustomobject]@{
                     Stream = $null

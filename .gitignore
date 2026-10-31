@@ -10,10 +10,6 @@ session.log.*
 *.TMP
 *~
 
-# The unit runner deletes and rewrites this file; it is a pass signal, not
-# source.
-tests/.report.json
-
 # Integration runs keep isolated state under a %TEMP% root named
 # wezterm-session-layer-it-<id>. If a failed run's artifacts are copied into
 # the tree, keep them out.

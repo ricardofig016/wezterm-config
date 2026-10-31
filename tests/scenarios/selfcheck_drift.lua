@@ -1,13 +1,14 @@
 -- Step 11: the self-check sees drift, logs it, and flashes the status.
 --
 -- The seeded state is geometrically valid, so the restore succeeds. Its second
--- pane has an empty cwd, which pane:split cannot apply: the live pane inherits
--- a real directory, so the post-restore self-check inside lib\layout sees a cwd
--- drift and takes the emission path (selfcheck.drift log plus the
--- " restore drift: N " status). Then the scenario changes the live layout with
--- an extra split and calls lib\layout.selfcheck through the public seam against
--- a report of the pre-split layout, proving the comparison itself catches the
--- drift rather than only the restore path.
+-- pane has a cwd that names a directory which does not exist, so pane:split
+-- cannot apply it: the live pane starts elsewhere and reports that other
+-- directory, which the post-restore self-check sees as a reported cwd drift and
+-- takes the emission path (selfcheck.drift log plus the " restore drift: N "
+-- status). Then the scenario changes the live layout with an extra split and
+-- calls lib\layout.selfcheck through the public seam against a report of the
+-- pre-split layout, proving the comparison itself catches the drift rather than
+-- only the restore path.
 local wezterm = require("wezterm")
 
 local config_dir = (wezterm.config_dir or ""):gsub("\\", "/"):gsub("/+$", "")
@@ -127,7 +128,6 @@ wezterm.on("gui-startup", function(_cmd)
             end
             add("rects_exact", mismatch == nil, mismatch or "both rectangles identical")
 
-            -- Emission path: the restore's own self-check must have logged the
             -- The restore's own self-check may wait for the shells to report
             -- cwd before it reports, so poll for the drift line before reading
             -- the status it just flashed.
