@@ -1328,4 +1328,34 @@ return {
             end)
         end,
     },
+    {
+        name = "restore accepts an active pane id of zero",
+        run = function(t)
+            local zero = sample_restore_state({
+                window = { cols = 99, rows = 50, active_tab = 1, active_pane = 0 },
+                tabs = {
+                    {
+                        title = "zero",
+                        panes = {
+                            {
+                                id = 0,
+                                rect = { left = 0, top = 0, width = 99, height = 50 },
+                                cwd = "C:\\zero",
+                            },
+                        },
+                    },
+                },
+            })
+            with_restore_env({}, function(env)
+                with_stub(layout, "selfcheck", function()
+                    return {}
+                end, function()
+                    t.eq(layout.restore(nil, zero), true)
+                end)
+                t.eq(env.spawn.args.width, 99)
+                t.eq(env.spawn.args.set_environment_variables.WEZTERM_SESSION_HISTORY_KEY, "0")
+                t.eq(env.spawn.pane.activations, 1, "pane id 0 must be found and activated")
+            end)
+        end,
+    },
 }

@@ -385,6 +385,26 @@ return {
         end,
     },
     {
+        name = "an active pane id of zero validates and round-trips",
+        run = function(t)
+            with_state_dir("active-pane-zero", function()
+                local zero = sample_state("1700000000-00aa01", 1700000000)
+                zero.window.active_pane = 0
+                t.ok(state.validate(zero), "pane id 0 must be accepted")
+                t.ok(state.write(zero), "a state with active pane 0 must be writable")
+                t.eq(state.read(zero.instance.id), zero)
+            end)
+        end,
+    },
+    {
+        name = "a negative active pane id is rejected",
+        run = function(t)
+            local negative = sample_state("1700000000-00aa01", 1700000000)
+            negative.window.active_pane = -1
+            t.eq(state.validate(negative), false, "a negative pane id is not a pane")
+        end,
+    },
+    {
         name = "the logger stays inert until init is called",
         run = function(t)
             t.eq(log.info("save.tick", {}), false, "a logger without init must not write")

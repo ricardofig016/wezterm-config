@@ -224,7 +224,9 @@ function M.validate(t)
     if not is_integer(window.active_tab) or window.active_tab < 1 then
         return false
     end
-    if not is_integer(window.active_pane) or window.active_pane < 1 then
+    -- active_tab is a one-based position, but active_pane is a pane id and this
+    -- build numbers panes from zero, so 0 is a valid active pane.
+    if not is_integer(window.active_pane) or window.active_pane < 0 then
         return false
     end
 
@@ -337,7 +339,7 @@ function M.empty()
         version = M.SCHEMA_VERSION,
         saved_at = now,
         instance = { id = M.instance_id(), started_at = now },
-        window = { cols = 0, rows = 0, active_tab = 1, active_pane = 1 },
+        window = { cols = 0, rows = 0, active_tab = 1, active_pane = 0 },
         tabs = {},
     }
 end
