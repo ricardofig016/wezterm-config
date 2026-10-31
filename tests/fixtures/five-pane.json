@@ -1,0 +1,16 @@
+{
+  "description": "Five-pane nested layout captured from a live WezTerm window; three distinct split boundaries.",
+  "window": {"cols": 190, "rows": 46},
+  "tabs": [
+    {
+      "title": "",
+      "panes": [
+        {"index": 1, "rect": {"left": 0, "top": 0, "width": 129, "height": 20}, "cwd": "C:/Users/rfigueiredo", "title": "pwsh.exe"},
+        {"index": 2, "rect": {"left": 130, "top": 0, "width": 60, "height": 20}, "cwd": "C:/Users/rfigueiredo", "title": "pwsh.exe"},
+        {"index": 3, "rect": {"left": 0, "top": 21, "width": 129, "height": 25}, "cwd": "C:/Users/rfigueiredo", "title": "pwsh.exe"},
+        {"index": 4, "rect": {"left": 130, "top": 21, "width": 60, "height": 14}, "cwd": "C:/Users/rfigueiredo", "title": "pwsh.exe"},
+        {"index": 5, "rect": {"left": 130, "top": 36, "width": 60, "height": 10}, "cwd": "C:/Users/rfigueiredo/", "title": "pwsh.exe"}
+      ]
+    }
+  ]
+}
