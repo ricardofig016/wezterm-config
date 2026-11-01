@@ -243,16 +243,28 @@ local function new_fake_env(options)
             self.splits[#self.splits + 1] = { args = args, child = child }
             return child
         end
-        -- A real pane reports cols, viewport_rows and more. Tests supply either
-        -- one fixed pair or a list of steps, so a grid can settle after a poll.
+        -- A real pane:get_dimensions() returns one table with cols,
+        -- viewport_rows and others. Tests supply either one fixed pair or a
+        -- list of steps, so a grid can settle after a poll. Returning a table
+        -- here is deliberate: the API shape is what the restore path reads.
         function pane:get_dimensions()
             self.dimension_calls = self.dimension_calls + 1
-            local steps = pane_options.dimensions
-            if type(steps) == "table" and #steps > 0 then
-                local step = steps[math.min(self.dimension_calls, #steps)]
-                return step.cols, step.rows
+            if pane_options.dimensions_not_table then
+                return "not a dimensions table"
             end
-            return pane_options.cols, pane_options.rows
+            local steps = pane_options.dimensions
+            local step
+            if type(steps) == "table" and #steps > 0 then
+                step = steps[math.min(self.dimension_calls, #steps)]
+            else
+                step = { cols = pane_options.cols, rows = pane_options.rows }
+            end
+            return {
+                cols = step.cols,
+                viewport_rows = step.rows,
+                scrollback_rows = 0,
+                dpi = 96,
+            }
         end
         function pane:get_foreground_process_info()
             self.info_calls = self.info_calls + 1
@@ -1044,6 +1056,54 @@ return {
                 t.eq(applied.fields.mode, "fullscreen")
                 t.eq(env.order[1], "fullscreen", "the toggle must run before any replay")
                 t.eq(env.spawn.window.statuses, {})
+            end)
+        end,
+    },
+    {
+        name = "a table-shaped matching grid does not wait and logs no mismatch",
+        run = function(t)
+            local maximized = sample_restore_state({
+                window = { cols = 200, rows = 50, active_tab = 2, active_pane = 21, mode = "maximized" },
+            })
+            with_restore_env({
+                pane_options = { dimensions = { { cols = 200, rows = 50 } } },
+            }, function(env, events)
+                with_stub(layout, "selfcheck", function()
+                    return {}
+                end, function()
+                    t.eq(layout.restore(nil, maximized), true)
+                end)
+                t.eq(env.spawn.pane.dimension_calls, 1, "a matching grid must settle on the first read")
+                t.eq(env.spawn.window.maximized, 1)
+                t.eq(#env.spawn.pane.splits, 1, "the splits must replay")
+                t.eq(find_event(events, "restore.mode_grid_mismatch"), nil)
+                local applied = find_event(events, "restore.mode_applied")
+                t.ok(applied ~= nil)
+                t.eq(applied.fields.mode, "maximized")
+                t.eq(env.spawn.window.statuses, {})
+            end)
+        end,
+    },
+    {
+        name = "a non-table pane dimension read is unknown and still replays",
+        run = function(t)
+            local maximized = sample_restore_state({
+                window = { cols = 200, rows = 50, active_tab = 2, active_pane = 21, mode = "maximized" },
+            })
+            with_restore_env({
+                pane_options = { dimensions_not_table = true },
+            }, function(env, events)
+                with_stub(layout, "selfcheck", function()
+                    return {}
+                end, function()
+                    t.eq(layout.restore(nil, maximized), true)
+                end)
+                t.eq(env.spawn.pane.dimension_calls, 31, "the wait must still be bounded")
+                t.eq(#env.spawn.pane.splits, 1, "the layout must still be replayed")
+                local mismatch = find_event(events, "restore.mode_grid_mismatch")
+                t.ok(mismatch ~= nil)
+                t.eq(mismatch.fields.actual_cols, nil)
+                t.eq(mismatch.fields.actual_rows, nil)
             end)
         end,
     },

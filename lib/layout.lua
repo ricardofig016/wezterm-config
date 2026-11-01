@@ -432,13 +432,15 @@ local function pane_dimensions(pane)
     if pane == nil then
         return nil, nil
     end
-    local ok, cols, rows = pcall(function()
+    local ok, dimensions = pcall(function()
         return pane:get_dimensions()
     end)
-    if not ok then
+    -- This build returns one table; a failed call or any other shape is
+    -- unknown, not a match.
+    if not ok or type(dimensions) ~= "table" then
         return nil, nil
     end
-    return cols, rows
+    return dimensions.cols, dimensions.viewport_rows
 end
 
 local function wait_for_grid(pane, cols, rows, done)
