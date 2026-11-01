@@ -609,10 +609,11 @@ local function schedule_foreground(pane, argv, pane_id, tab_index)
     wezterm.time.call_after(FOREGROUND_POLL_DELAY, poll)
 end
 
--- latest is the state on_gui_startup read, or nil when there is none. restore
+-- latest is the state on_gui_startup read, or nil when there is none. pinned is
+-- true when latest came from the pinned file, which never expires. restore
 -- itself never reads the disk, so the decision logic is testable with a fake
 -- mux. It returns true only when the saved layout was rebuilt.
-function M.restore(cmd, latest)
+function M.restore(cmd, latest, pinned)
     if type(latest) ~= "table" then
         log.warn("restore.no_state")
         return fallback(cmd)
@@ -631,7 +632,7 @@ function M.restore(cmd, latest)
         return fallback(cmd)
     end
 
-    if state.is_stale(latest) then
+    if not pinned and state.is_stale(latest) then
         log.warn("restore.stale", {
             saved_at = tostring(latest.saved_at),
             max_age = state.MAX_AGE_SECONDS,
@@ -827,13 +828,41 @@ end
 function M.on_gui_startup(cmd)
     pcall(log.init)
 
-    local read_ok, latest = pcall(state.read_latest)
-    if not read_ok then
-        log.error("restore.read_failed", { error = tostring(latest) })
-        latest = nil
+    -- A pin always wins and never expires. A corrupt pin is reported and then
+    -- ignored, so the newest session state still gets its normal chance.
+    local pinned
+    local pinned_ok, pinned_value, pinned_error = pcall(state.read_pinned)
+    if not pinned_ok then
+        log.warn("restore.pinned_invalid", { error = tostring(pinned_value) })
+    elseif pinned_value ~= nil then
+        pinned = pinned_value
+        local pinned_tabs = type(pinned.tabs) == "table" and pinned.tabs or {}
+        local pinned_panes = 0
+        for _, tab in ipairs(pinned_tabs) do
+            if type(tab.panes) == "table" then
+                pinned_panes = pinned_panes + #tab.panes
+            end
+        end
+        log.info("restore.pinned", {
+            pinned_at = pinned.pinned_at,
+            tabs = #pinned_tabs,
+            panes = pinned_panes,
+        })
+    elseif pinned_error ~= nil then
+        log.warn("restore.pinned_invalid", { path = state.pinned_path() })
     end
 
-    local ok, err = pcall(M.restore, cmd, latest)
+    local latest = pinned
+    if latest == nil then
+        local read_ok, value = pcall(state.read_latest)
+        if not read_ok then
+            log.error("restore.read_failed", { error = tostring(value) })
+        else
+            latest = value
+        end
+    end
+
+    local ok, err = pcall(M.restore, cmd, latest, pinned ~= nil)
     if not ok then
         log.error("restore.failed", { error = tostring(err) })
         fallback(cmd)

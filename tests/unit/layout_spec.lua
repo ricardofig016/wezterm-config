@@ -339,6 +339,17 @@ local function with_restore_env(options, fn)
     }
     local events = {}
 
+    -- Never touch real state from a startup-handler test: an unpinned result and
+    -- a zero prune are the defaults; individual tests override these stubs.
+    local real_read_pinned = state.read_pinned
+    local real_prune = state.prune
+    state.read_pinned = function()
+        return nil
+    end
+    state.prune = function()
+        return 0
+    end
+
     log.init = function()
         env.init_calls = (env.init_calls or 0) + 1
         return true
@@ -361,6 +372,8 @@ local function with_restore_env(options, fn)
 
     wezterm.mux = real_mux
     wezterm.time = real_time
+    state.read_pinned = real_read_pinned
+    state.prune = real_prune
     log.init = real_log.init
     log.debug = real_log.debug
     log.info = real_log.info
@@ -1666,6 +1679,87 @@ return {
                     t.ok(pruned ~= nil)
                     t.eq(pruned.fields.removed, 2)
                 end)
+            end)
+        end,
+    },
+    {
+        name = "a pinned layout wins over a newer session",
+        run = function(t)
+            local pinned = sample_restore_state({
+                saved_at = os.time() - state.MAX_AGE_SECONDS - 100,
+                pinned_at = 1700000500,
+                window = { cols = 120, rows = 35, active_tab = 1, active_pane = 10 },
+                tabs = {
+                    {
+                        title = "pinned",
+                        panes = {
+                            {
+                                id = 10,
+                                rect = { left = 0, top = 0, width = 120, height = 35 },
+                                cwd = "C:\\pin",
+                            },
+                        },
+                    },
+                },
+            })
+            local latest_calls = 0
+            with_restore_env({}, function(env, events)
+                with_stub(state, "read_pinned", function()
+                    return pinned
+                end, function()
+                    with_stub(state, "read_latest", function()
+                        latest_calls = latest_calls + 1
+                        return sample_restore_state()
+                    end, function()
+                        t.eq(layout.on_gui_startup(nil), true)
+                    end)
+                end)
+                t.eq(latest_calls, 0, "a valid pin must not consult the session files")
+                t.eq(env.spawn.args.width, 120)
+                t.eq(env.spawn.args.height, 35)
+                t.eq(env.spawn.args.cwd, "C:\\pin")
+                local pinned_event = find_event(events, "restore.pinned")
+                t.ok(pinned_event ~= nil)
+                t.eq(pinned_event.fields.pinned_at, 1700000500)
+                t.eq(pinned_event.fields.tabs, 1)
+                t.eq(pinned_event.fields.panes, 1)
+                t.eq(find_event(events, "restore.stale"), nil, "a pin must not be rejected as stale")
+            end)
+        end,
+    },
+    {
+        name = "a corrupt pin falls back to the newest session",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                with_stub(state, "read_pinned", function()
+                    return nil, "invalid"
+                end, function()
+                    with_stub(state, "read_latest", function()
+                        return sample_restore_state()
+                    end, function()
+                        t.eq(layout.on_gui_startup(nil), true)
+                    end)
+                end)
+                t.ok(find_event(events, "restore.pinned_invalid") ~= nil)
+                t.eq(find_event(events, "restore.pinned"), nil)
+                t.eq(env.spawn.args.width, 200)
+                t.eq(env.spawn.args.cwd, "C:\\a")
+            end)
+        end,
+    },
+    {
+        name = "with no pin the newest session is restored",
+        run = function(t)
+            with_restore_env({}, function(env, events)
+                with_stub(state, "read_latest", function()
+                    return sample_restore_state()
+                end, function()
+                    t.eq(layout.on_gui_startup(nil), true)
+                end)
+                t.eq(env.spawn.args.width, 200)
+                t.eq(env.spawn.args.cwd, "C:\\a")
+                t.eq(find_event(events, "restore.pinned"), nil)
+                t.eq(find_event(events, "restore.pinned_invalid"), nil)
             end)
         end,
     },
