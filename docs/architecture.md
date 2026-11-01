@@ -14,8 +14,9 @@ the plan.
 
 The schema is version 1. One JSON file per live instance lives at
 `<state dir>\sessions\<instance id>.json`, with a transient
-`<instance id>.json.tmp` during a write. There is no index file and no single
-"current session" file.
+`<instance id>.json.tmp` during a write. An optional pin lives at
+`<state dir>\pinned.json`, beside the sessions folder rather than inside it.
+There is no index file and no single "current session" file.
 
 `version` is the integer `1`. `state.validate` rejects any other value, and
 `read_latest` validates every candidate before returning it, so a wrong or
@@ -26,10 +27,18 @@ unvalidated state, which is how the fault and layout specs pin it. State spec:
 "read and read_latest reject a mismatched schema version". Fault spec: "a
 schema mismatch logs, shows a failure and opens a maximized fallback".
 
-`saved_at` is Unix seconds. Restore rejects a state older than 604800 seconds
-(seven days) and logs `restore.stale`. State spec: "is_stale compares against
-the seven day cap". Fault spec: "a stale state file logs, shows a failure and
-opens a maximized fallback".
+`saved_at` is Unix seconds. Restore rejects a session state older than 604800
+seconds (seven days) and logs `restore.stale`. State spec: "is_stale compares
+against the seven day cap". Fault spec: "a stale state file logs, shows a
+failure and opens a maximized fallback".
+
+`pinned_at` is present only in `pinned.json`: Unix seconds when the layout was
+pinned. A pinned state is a complete version 1 state plus that field.
+`write_pinned` refuses a state without a non-negative integer `pinned_at`.
+`read_pinned` treats a pin file that exists but does not validate as corrupt
+rather than as an empty pin; a missing file simply means no pin. State spec: "a
+pinned state round-trips and unpin reports absence", "pinned state is validated
+strictly and corrupt files are refused".
 
 `instance` is `{ id, started_at }`. `id` is minted once per process from the
 current time and a random suffix, then memoized, so every save from one process
@@ -91,24 +100,61 @@ and it is a command line, not saved screen output. Layout spec: "restore replays
 full-screen program once the shell answers". Save spec: "collect records
 alt-screen foreground only when a process record exists".
 
-Per-instance files mean the newest `saved_at` wins. `read_latest` lists
-`sessions\` with `wezterm.read_dir`, validates each file, and returns the valid
-one with the greatest `saved_at`; a tie breaks on the instance id so the result
-is deterministic. A file that fails validation is skipped, never repaired. The
-writer opens `<id>.json.tmp`, writes, reads the file back, parses it, checks
-the version and validates it, and only then replaces `<id>.json`. Windows
-rename refuses an existing destination, so the old file is removed only after
-the temporary file has proved itself, and the rename is retried. A crash can
-leave a `.tmp`; the next save from that instance truncates it. State spec: "a
-full state round-trips through write and read", "read_latest picks the largest
-saved_at and breaks ties by instance id", "a truncated temporary file leaves
-the previous state intact".
+With no pin, per-instance files mean the newest `saved_at` wins. `read_latest`
+lists `sessions\` with `wezterm.read_dir`, validates each file, and returns the
+valid one with the greatest `saved_at`; a tie breaks on the instance id so the
+result is deterministic. A file that fails validation is skipped, never
+repaired. The writer opens `<id>.json.tmp`, writes, reads the file back, parses
+it, checks the version and validates it, and only then replaces `<id>.json`.
+Windows rename refuses an existing destination, so the old file is removed only
+after the temporary file has proved itself, and the rename is retried. A crash
+can leave a `.tmp`; the next save from that instance truncates it. State spec:
+"a full state round-trips through write and read", "read_latest picks the
+largest saved_at and breaks ties by instance id", "a truncated temporary file
+leaves the previous state intact".
 
 The state directory defaults to
 `C:\Users\rfigueiredo\AppData\Roaming\wezterm-session-layer` and
-`WEZTERM_SESSION_STATE_DIR` overrides it. Tests use the override so they never
-read or write the live directory. State spec: "state directory honours
+`WEZTERM_SESSION_STATE_DIR` overrides it. Tests use the override so their state
+stays in isolated directories; the suite guard below makes a forgotten
+override fail loudly, and the runner fingerprints the live directory to prove
+it did not change. State spec: "state directory honours
 WEZTERM_SESSION_STATE_DIR and its pinned fallback".
+
+## Restore precedence
+
+Startup reads `pinned.json` before any session file. A valid pin wins over
+every session file and never expires: restore skips the seven day staleness
+check when the state came from the pin. Without a pin, restore uses the newest
+valid session. A corrupt pin logs `restore.pinned_invalid` and is ignored, so
+restore falls through to the newest session instead of maximizing; it
+maximizes only when no valid session exists either. A valid pin logs
+`restore.pinned` with `pinned_at`, `tabs` and `panes`. Layout spec: "a pinned
+layout wins over a newer session", "a corrupt pin falls back to the newest
+session", "with no pin the newest session is restored". State spec: "a pinned
+state never expires".
+
+Integration scenario `pinned_layout_wins` builds a distinctive three-pane
+layout, pins it, lets a throwaway window write a newer session, and then
+launches a third process that must restore the pin, match the `restore.pinned`
+fields, keep every pinned rectangle, bring back none of the newer-only
+rectangles, and leave both the pin and the newer session file intact. Its
+checks include `pinned_rects_exact`, `newer_rects_absent`,
+`restore_pinned_fields` and `newer_session_kept`.
+
+## Pruning
+
+Prune keeps the three newest session files regardless of age and removes a
+stale file only when it falls beyond those three. It never lists, counts or
+removes `pinned.json`. It runs once per startup, one second after the restore
+attempt, so parsing every session file never delays the first usable window;
+the run logs `restore.pruned` with the removed count, or
+`restore.prune_failed`. State spec: "prune keeps the three newest sessions and
+never touches the pin", "prune keeps the three newest sessions and leaves
+unreadable files alone". Fault spec: "pruning keeps the three newest and
+removes only stale files beyond them". Layout spec: "startup prunes stale
+state once and logs the count", "startup logs a zero prune count when nothing
+is stale", "a prune failure is logged and never breaks startup".
 
 ## Invariants
 
@@ -290,6 +336,24 @@ every random seed through the GUI would cost minutes per run and would exercise
 the same split arithmetic; the fixture is the regression input for the one-cell
 divider.
 
+## Why the suite cannot touch the real state
+
+The runner sets `WEZTERM_SESSION_TEST=1` in its own process before it launches
+anything, so the headless harness, the shell child, every scenario child and
+every `wezterm-gui` inherit it. Under that marker the state writer refuses the
+default state directory unless `WEZTERM_SESSION_STATE_DIR` is set:
+`state.write` and `state.write_pinned` return an error and log `save.blocked`.
+State spec: "the test guard refuses writes without a state override".
+
+The runner also fingerprints `%APPDATA%\wezterm-session-layer` before and after
+every invocation, recording existence, relative names, and each file's size and
+modification time, and fails the run on any addition, removal or change. The
+negative proof was a probe file created in the real directory during a run:
+the runner failed with `added _guard_probe_<guid>.tmp`. The positive proof is
+the `pinned_layout_wins` scenario, which pins a layout and launches two more
+processes against an isolated state directory; it passes without changing the
+real one.
+
 ## How to verify
 
 Run `pwsh -NoProfile -File tests\run.ps1 -All`. It runs the headless unit suite
@@ -304,6 +368,6 @@ finding" and "a reported cwd mismatch keeps driving drift and status after the
 settle window"; `tests\unit\save_spec.lua` "the debounce writes
 after two stable seconds and not while idle"; the shell cases `restored-key`,
 `pane-fallback` and `no-key`; and the integration scenarios `full_restore`,
-`selfcheck_drift` and `fixture_roundtrip`. The plan behind the layer lives in
-`plans\wezterm-session-layer\plan.md`; it is git-ignored, so the tests are the
-durable check.
+`selfcheck_drift`, `fixture_roundtrip` and `pinned_layout_wins`. The plan behind
+the layer lives in `plans\wezterm-session-layer\plan.md`; it is git-ignored, so
+the tests are the durable check.

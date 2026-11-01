@@ -10,11 +10,12 @@ text.
 
 `wezterm.lua` is the entry. It assembles static options from `lib\config.lua`
 and keys from `lib\keys.lua`, then registers two gui-startup handlers.
-`lib\layout.lua` reads the newest valid state and restores it, and
-`lib\save.lua` starts a one-second change detector that writes two seconds
-after the window fingerprint settles. `lib\state.lua` owns schema version 1,
-one JSON file per instance under `<state dir>\sessions\`, atomic replace,
-staleness and newest-file selection. `shell\history.ps1` points PSReadLine at
+`lib\layout.lua` reads the pinned layout first, then the newest valid session,
+and restores it. `lib\save.lua` starts a one-second change detector that
+writes two seconds after the window fingerprint settles. `lib\state.lua` owns
+schema version 1, one JSON file per instance under `<state dir>\sessions\`, an
+optional pin at `<state dir>\pinned.json`, atomic replace, session staleness
+and newest-file selection. `shell\history.ps1` points PSReadLine at
 `<state dir>\history\<pane id>.txt`. `lib\log.lua` writes structured lines to
 `<state dir>\session.log`.
 
@@ -42,6 +43,15 @@ dot-sources `shell\history.ps1`. A restored pane carries
 `<state dir>\history\<saved pane id>.txt`. A pane created by hand falls back to
 `WEZTERM_PANE`. A shell outside WezTerm keeps the global history file.
 
+## Usage
+
+`Alt+P` pins the current layout and `Alt+Shift+P` unpins it. Restore brings
+back the pinned layout ahead of any session file, and a pin never expires on
+its own. A pin is a snapshot: after you rearrange panes deliberately, press
+`Alt+P` again, or restore keeps bringing back the old arrangement. `Alt+P`
+shows ` pinned HH:MM:SS ` in the status area; `Alt+Shift+P` shows ` unpinned `
+or ` nothing pinned `. Unpinning returns restore to the newest session file.
+
 ## Test
 
 Run all three suites with one command:
@@ -60,15 +70,16 @@ process. A passing run prints one PASS line per suite or scenario and exits 0.
 ## Reset the session
 
 Close WezTerm first, then delete the state directory to forget every saved
-layout and every per-pane history file:
+layout, the pinned layout and every per-pane history file:
 
     Remove-Item -Recurse -Force "$env:APPDATA\wezterm-session-layer"
 
 To forget one instance only, delete
-`%APPDATA%\wezterm-session-layer\sessions\<instance id>.json`. Restore reads
-the valid file with the newest `saved_at` across the folder, so the other
-instances are untouched. `WEZTERM_SESSION_STATE_DIR` moves the whole state
-directory.
+`%APPDATA%\wezterm-session-layer\sessions\<instance id>.json`. That removes the
+instance's session file, but if a pin exists it still wins restore; delete
+`%APPDATA%\wezterm-session-layer\pinned.json` or press `Alt+Shift+P` to forget
+the pin. Without a pin, restore reads the valid session file with the newest
+`saved_at`. `WEZTERM_SESSION_STATE_DIR` moves the whole state directory.
 
 ## Roll back
 
@@ -78,4 +89,5 @@ Restoring it returns the original prompt and stops loading the per-pane history
 hook. The config backup that step 13 creates is
 `C:\Users\rfigueiredo\.wezterm.lua.pre-session-layer.bak`; it holds the archived
 plugin config. To roll back, copy both backups into place and delete the state
-directory. `docs\rollback.md` has the commands and the order to run them.
+directory. Deleting it also removes `pinned.json`, so the rollback clears the
+pin too. `docs\rollback.md` has the commands and the order to run them.
