@@ -378,6 +378,19 @@ local function show_failure(window)
     return show_status(window, " save failed ", M.FAILURE_STATUS_SECONDS)
 end
 
+local function report_failure(window, trigger, reason, instance)
+    local fields = {
+        trigger = trigger,
+        reason = tostring(reason),
+    }
+    if instance ~= nil then
+        fields.instance = tostring(instance)
+    end
+    safe_log("error", "save.failed", fields)
+    show_failure(window)
+    return false
+end
+
 local function pane_count(snapshot)
     local count = 0
     for _, tab in ipairs(snapshot.tabs) do
@@ -547,6 +560,60 @@ function M.save_now(window)
 
     local clock = os.date("%H:%M:%S")
     show_status(window, " saved " .. clock .. " ", M.STATUS_SECONDS)
+    return true
+end
+
+-- ALT+p. A pin is a separate file; it never touches this instance's session
+-- file or the detector's last-written/pending state.
+function M.pin_now(window)
+    if window == nil then
+        return report_failure(nil, "pin", "no window")
+    end
+
+    local snapshot, err = M.collect(window)
+    if snapshot == nil then
+        return report_failure(window, "pin", err)
+    end
+
+    snapshot.pinned_at = now_seconds()
+    local ok, wrote, reason = pcall(state.write_pinned, snapshot)
+    if not ok then
+        return report_failure(window, "pin", wrote, snapshot.instance.id)
+    end
+    if not wrote then
+        return report_failure(
+            window,
+            "pin",
+            reason or "state.write_pinned refused the snapshot",
+            snapshot.instance.id
+        )
+    end
+
+    safe_log("info", "save.pinned", {
+        instance = tostring(snapshot.instance.id),
+        tabs = #snapshot.tabs,
+        panes = pane_count(snapshot),
+        pinned_at = snapshot.pinned_at,
+    })
+    local clock = os.date("%H:%M:%S")
+    show_status(window, " pinned " .. clock .. " ", M.STATUS_SECONDS)
+    return true
+end
+
+-- ALT+SHIFT+P. Removing a pin that is already absent is success, not an error.
+function M.unpin_now(window)
+    local ok, removed = pcall(state.unpin)
+    if not ok then
+        return report_failure(window, "unpin", removed)
+    end
+
+    if removed then
+        safe_log("info", "save.unpinned", { removed = true })
+        show_status(window, " unpinned ", M.STATUS_SECONDS)
+    else
+        safe_log("info", "save.unpinned", { removed = false })
+        show_status(window, " nothing pinned ", M.STATUS_SECONDS)
+    end
     return true
 end
 

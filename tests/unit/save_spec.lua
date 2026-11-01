@@ -199,6 +199,18 @@ local function with_blocked_state_write(blocked, fn)
     end
 end
 
+local function with_failing_unpin(fn)
+    local real_unpin = state.unpin
+    state.unpin = function()
+        error("forced unpin failure")
+    end
+    local ok, err = pcall(fn)
+    state.unpin = real_unpin
+    if not ok then
+        error(err, 0)
+    end
+end
+
 return {
     {
         name = "collect reads tabs, titles, pane rects, cwds, active tab position and active pane id",
@@ -648,6 +660,148 @@ return {
             end)
             t.eq(save.DEBOUNCE_MS, save.DEFAULT_DEBOUNCE_MS)
             t.eq(save.TICK_MS, save.DEFAULT_TICK_MS)
+        end,
+    },
+    {
+        name = "pin_now writes the pinned layout and reports tab and pane counts",
+        run = function(t)
+            with_state_dir("pin-write", function()
+                local window = status_window({ id = 71, cwd = "/C:/pinned" })
+                with_fake_timers(function(timers)
+                    with_captured_logs(function(events)
+                        t.eq(save.pin_now(window), true)
+                        local pinned = state.read_pinned()
+                        t.ok(pinned ~= nil, "the pinned file must exist and validate")
+                        t.eq(pinned.window.active_pane, 71, "the pin keeps the active pane id")
+                        t.ok(type(pinned.pinned_at) == "number", "the pin needs a timestamp")
+                        t.ok(
+                            window.status:match("^ pinned %d%d:%d%d:%d%d $") ~= nil,
+                            "unexpected status: " .. tostring(window.status)
+                        )
+                        t.eq(#timers, 1)
+                        t.eq(timers[1].seconds, save.STATUS_SECONDS)
+                        t.eq(#events, 1)
+                        t.eq(events[1].event, "save.pinned")
+                        t.eq(events[1].level, "info")
+                        t.eq(events[1].fields.tabs, 1)
+                        t.eq(events[1].fields.panes, 1)
+                    end)
+                end)
+            end)
+        end,
+    },
+    {
+        name = "unpin_now removes the pin and reports success",
+        run = function(t)
+            with_state_dir("pin-unpin", function()
+                local window = status_window({ id = 72, cwd = "/C:/unpin" })
+                with_fake_timers(function(timers)
+                    with_captured_logs(function(events)
+                        t.eq(save.pin_now(window), true)
+                        t.ok(state.read_pinned() ~= nil)
+                        t.eq(save.unpin_now(window), true)
+                        t.eq(state.read_pinned(), nil)
+                        t.eq(window.status, " unpinned ")
+                        t.eq(#timers, 2)
+                        t.eq(timers[2].seconds, save.STATUS_SECONDS)
+                        t.eq(events[#events].event, "save.unpinned")
+                        t.eq(events[#events].fields.removed, true)
+                    end)
+                end)
+            end)
+        end,
+    },
+    {
+        name = "unpin_now with nothing pinned is success with a distinct message",
+        run = function(t)
+            with_state_dir("pin-empty", function()
+                local window = status_window({ id = 73, cwd = "/C:/empty" })
+                with_fake_timers(function(timers)
+                    with_captured_logs(function(events)
+                        t.eq(save.unpin_now(window), true)
+                        t.eq(window.status, " nothing pinned ")
+                        t.eq(#timers, 1)
+                        t.eq(timers[1].seconds, save.STATUS_SECONDS)
+                        t.eq(events[#events].event, "save.unpinned")
+                        t.eq(events[#events].fields.removed, false)
+                    end)
+                end)
+            end)
+        end,
+    },
+    {
+        name = "a refused pin write shows save failed and logs the reason",
+        run = function(t)
+            with_state_dir("pin-failure", function()
+                local window = status_window({ id = 74, cwd = "/C:/fail" })
+                local blocked = state.pinned_path() .. ".tmp"
+                with_fake_timers(function(timers)
+                    with_captured_logs(function(events)
+                        with_blocked_state_write(blocked, function()
+                            t.eq(save.pin_now(window), false, "a refused pin must return false")
+                        end)
+
+                        t.eq(window.status, " save failed ")
+                        t.eq(state.read_pinned(), nil, "a refused pin must leave no pinned file")
+                        t.eq(#timers, 1)
+                        t.eq(timers[1].seconds, save.FAILURE_STATUS_SECONDS)
+                        t.eq(events[#events].event, "save.failed")
+                        t.eq(events[#events].level, "error")
+                        t.eq(events[#events].fields.trigger, "pin")
+                        t.ok(
+                            type(events[#events].fields.reason) == "string"
+                                and events[#events].fields.reason ~= "",
+                            "the failure must carry a reason"
+                        )
+                    end)
+                end)
+            end)
+        end,
+    },
+    {
+        name = "a failed unpin shows save failed and returns false",
+        run = function(t)
+            with_state_dir("unpin-failure", function()
+                local window = status_window({ id = 75, cwd = "/C:/fail" })
+                with_fake_timers(function(timers)
+                    with_captured_logs(function(events)
+                        with_failing_unpin(function()
+                            t.eq(save.unpin_now(window), false, "an unpin error must return false")
+                        end)
+
+                        t.eq(window.status, " save failed ")
+                        t.eq(#timers, 1)
+                        t.eq(timers[1].seconds, save.FAILURE_STATUS_SECONDS)
+                        t.eq(events[#events].event, "save.failed")
+                        t.eq(events[#events].fields.trigger, "unpin")
+                    end)
+                end)
+            end)
+        end,
+    },
+    {
+        name = "pinning does not change the newest session file",
+        run = function(t)
+            with_state_dir("pin-session", function()
+                local window = status_window({ id = 76, cwd = "/C:/session" })
+                with_fake_timers(function()
+                    with_captured_logs(function()
+                        t.eq(save.save_now(window), true)
+                        local before = state.read(state.instance_id())
+                        t.ok(before ~= nil, "the seed session must be readable")
+
+                        t.eq(save.pin_now(window), true)
+                        local after = state.read(state.instance_id())
+                        t.eq(after, before, "the session file must be byte-for-byte equivalent in state")
+
+                        local latest = state.read_latest()
+                        t.ok(latest ~= nil)
+                        t.eq(latest.instance.id, before.instance.id)
+                        t.eq(latest.saved_at, before.saved_at)
+                        t.ok(state.read_pinned() ~= nil, "the pin must exist")
+                    end)
+                end)
+            end)
         end,
     },
 }
