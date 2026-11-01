@@ -407,16 +407,22 @@ local function saved_window_mode(window)
     return window.mode
 end
 
--- maximize() already swallows a missing GUI window. Fullscreen is a key
--- action, so it goes through the mux window's action path, the same path a key
--- assignment uses.
-local function apply_window_mode(window, mode, pane)
+-- maximize() already swallows a missing GUI window. Fullscreen lives on the
+-- GUI window too: the mux window spawn_window returns has no perform_action,
+-- and this build exposes fullscreen only as toggle_fullscreen(). A missing GUI
+-- window or a refused toggle reports false so the grid wait still replays the
+-- layout on the current grid.
+local function apply_window_mode(window, mode)
     if mode == "maximized" then
         return maximize(window)
     end
     if mode == "fullscreen" then
         return pcall(function()
-            window:perform_action(wezterm.action.ToggleFullScreen, pane)
+            local gui_window = window ~= nil and window:gui_window() or nil
+            if gui_window == nil then
+                error("no gui window for fullscreen")
+            end
+            gui_window:toggle_fullscreen()
         end)
     end
     return true
@@ -906,7 +912,7 @@ function M.restore(cmd, latest, pinned)
         return build()
     end
 
-    local applied = apply_window_mode(window, mode, spawned_pane)
+    local applied = apply_window_mode(window, mode)
     if applied then
         log.info("restore.mode_applied", { mode = mode })
     else

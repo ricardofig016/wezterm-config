@@ -222,6 +222,8 @@ local function new_fake_env(options)
         panes = {},
         windows = {},
         order = {},
+        gui_window_nil = options.gui_window_nil,
+        toggle_fullscreen_raises = options.toggle_fullscreen_raises,
     }
 
     local function make_pane(pane_options)
@@ -297,9 +299,9 @@ local function new_fake_env(options)
     local function make_window()
         local window = {
             maximized = 0,
+            fullscreen_toggles = 0,
             spawn_tab_calls = {},
             statuses = {},
-            perform_actions = {},
         }
         function window:spawn_tab(args)
             local tab = make_tab()
@@ -310,14 +312,10 @@ local function new_fake_env(options)
             env.panes[#env.panes + 1] = pane
             return tab, pane, window
         end
-        function window:perform_action(action, pane)
-            window.perform_actions[#window.perform_actions + 1] = {
-                action = action,
-                pane = pane,
-            }
-            env.order[#env.order + 1] = "fullscreen"
-        end
         function window:gui_window()
+            if env.gui_window_nil then
+                return nil
+            end
             if env.status_raises then
                 error("no status area")
             end
@@ -325,6 +323,13 @@ local function new_fake_env(options)
                 maximize = function()
                     window.maximized = window.maximized + 1
                     env.order[#env.order + 1] = "maximize"
+                end,
+                toggle_fullscreen = function()
+                    if env.toggle_fullscreen_raises then
+                        error("toggle refused")
+                    end
+                    window.fullscreen_toggles = window.fullscreen_toggles + 1
+                    env.order[#env.order + 1] = "fullscreen"
                 end,
                 set_right_status = function(_, text)
                     window.statuses[#window.statuses + 1] = text
@@ -951,7 +956,7 @@ return {
                     t.eq(layout.restore(nil, normal), true)
                 end)
                 t.eq(env.spawn.window.maximized, 0, "a normal window must not be maximized")
-                t.eq(env.spawn.window.perform_actions, {}, "a normal window must not toggle fullscreen")
+                t.eq(env.spawn.window.fullscreen_toggles, 0, "a normal window must not toggle fullscreen")
                 t.eq(env.spawn.pane.dimension_calls, 0, "a normal restore must not wait for a mode")
                 t.eq(#env.spawn.pane.splits, 1, "the splits must replay as before")
                 t.eq(find_event(events, "restore.mode_applied"), nil)
@@ -973,7 +978,7 @@ return {
                     t.eq(layout.restore(nil, old), true)
                 end)
                 t.eq(env.spawn.window.maximized, 0)
-                t.eq(env.spawn.window.perform_actions, {})
+                t.eq(env.spawn.window.fullscreen_toggles, 0)
                 t.eq(env.spawn.pane.dimension_calls, 0)
                 t.eq(find_event(events, "restore.mode_applied"), nil)
                 t.ok(find_event(events, "restore.done") ~= nil)
@@ -1002,7 +1007,7 @@ return {
                     t.eq(layout.restore(nil, maximized), true)
                 end)
                 t.eq(env.spawn.window.maximized, 1, "the saved maximize must be applied once")
-                t.eq(env.spawn.window.perform_actions, {}, "maximize must not toggle fullscreen")
+                t.eq(env.spawn.window.fullscreen_toggles, 0, "maximize must not toggle fullscreen")
                 t.eq(env.spawn.pane.dimension_calls, 2, "the grid must be polled until it matches")
                 t.eq(#env.spawn.pane.splits, 1, "the splits must replay on the matched grid")
                 local applied = find_event(events, "restore.mode_applied")
@@ -1039,22 +1044,68 @@ return {
                     t.eq(layout.restore(nil, fullscreen), true)
                 end)
                 t.eq(env.spawn.window.maximized, 0, "fullscreen must not call maximize")
-                t.eq(#env.spawn.window.perform_actions, 1, "one ToggleFullScreen action")
-                t.eq(
-                    env.spawn.window.perform_actions[1].action,
-                    wezterm.action.ToggleFullScreen,
-                    "the action must be ToggleFullScreen"
-                )
-                t.ok(
-                    env.spawn.window.perform_actions[1].pane == env.spawn.pane,
-                    "the action must be performed for the spawned pane"
-                )
+                t.eq(env.spawn.window.fullscreen_toggles, 1, "the GUI window must toggle fullscreen once")
                 t.eq(env.spawn.pane.dimension_calls, 1)
                 t.eq(#env.spawn.pane.splits, 1)
                 local applied = find_event(events, "restore.mode_applied")
                 t.ok(applied ~= nil)
                 t.eq(applied.fields.mode, "fullscreen")
                 t.eq(env.order[1], "fullscreen", "the toggle must run before any replay")
+                t.eq(env.spawn.window.statuses, {})
+            end)
+        end,
+    },
+    {
+        name = "fullscreen without a GUI window logs mode_failed and still replays",
+        run = function(t)
+            local fullscreen = sample_restore_state({
+                window = { cols = 200, rows = 50, active_tab = 2, active_pane = 21, mode = "fullscreen" },
+            })
+            with_restore_env({
+                pane_options = { dimensions = { { cols = 200, rows = 50 } } },
+                gui_window_nil = true,
+            }, function(env, events)
+                with_stub(layout, "selfcheck", function()
+                    return {}
+                end, function()
+                    t.eq(layout.restore(nil, fullscreen), true)
+                end)
+                local failed = find_event(events, "restore.mode_failed")
+                t.ok(failed ~= nil, "a missing GUI window must be logged")
+                t.eq(failed.level, "warn")
+                t.eq(failed.fields.mode, "fullscreen")
+                t.eq(find_event(events, "restore.mode_applied"), nil)
+                t.eq(env.spawn.window.fullscreen_toggles, 0)
+                t.eq(#env.spawn.pane.splits, 1, "the layout must still replay")
+                t.eq(#env.windows, 1, "a failed mode must not fall back to another window")
+                t.eq(env.spawn.window.maximized, 0)
+                t.eq(env.spawn.window.statuses, {})
+            end)
+        end,
+    },
+    {
+        name = "a raising fullscreen toggle logs mode_failed and still replays",
+        run = function(t)
+            local fullscreen = sample_restore_state({
+                window = { cols = 200, rows = 50, active_tab = 2, active_pane = 21, mode = "fullscreen" },
+            })
+            with_restore_env({
+                pane_options = { dimensions = { { cols = 200, rows = 50 } } },
+                toggle_fullscreen_raises = true,
+            }, function(env, events)
+                with_stub(layout, "selfcheck", function()
+                    return {}
+                end, function()
+                    t.eq(layout.restore(nil, fullscreen), true)
+                end)
+                local failed = find_event(events, "restore.mode_failed")
+                t.ok(failed ~= nil, "a refused toggle must be logged")
+                t.eq(failed.level, "warn")
+                t.eq(failed.fields.mode, "fullscreen")
+                t.eq(find_event(events, "restore.mode_applied"), nil)
+                t.eq(env.spawn.window.fullscreen_toggles, 0)
+                t.eq(#env.spawn.pane.splits, 1, "the layout must still replay")
+                t.eq(#env.windows, 1, "a failed mode must not fall back to another window")
                 t.eq(env.spawn.window.statuses, {})
             end)
         end,
