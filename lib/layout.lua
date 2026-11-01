@@ -34,10 +34,11 @@
 --
 -- restore(cmd, latest) spawns the saved window and rebuilds its tabs from a
 -- state that on_gui_startup already read. It validates the state, plans every
--- tab before touching the mux, then spawns with saved cell dimensions and
--- replays each tab. Every rejection or rebuild failure logs a restore. event
--- and falls back to a maximized window, so a bad state never leaves the user
--- without a terminal.
+-- tab before touching the mux, then spawns with saved cell dimensions. A saved
+-- maximize or fullscreen is applied before any split is replayed, and restore
+-- waits for the grid to settle to the saved size before replaying. Every
+-- rejection or rebuild failure logs a restore. event and falls back to a
+-- maximized window, so a bad state never leaves the user without a terminal.
 local wezterm = require("wezterm")
 
 local state = require("lib.state")
@@ -390,6 +391,77 @@ local function existing_window()
     return last
 end
 
+-- Older states carry no mode, so a missing mode is a normal window. Anything
+-- else is a value state.validate already refused; mapping it to normal keeps
+-- restore from inventing a mode it cannot apply.
+local WINDOW_MODES = {
+    normal = true,
+    maximized = true,
+    fullscreen = true,
+}
+
+local function saved_window_mode(window)
+    if type(window) ~= "table" or not WINDOW_MODES[window.mode] then
+        return "normal"
+    end
+    return window.mode
+end
+
+-- maximize() already swallows a missing GUI window. Fullscreen is a key
+-- action, so it goes through the mux window's action path, the same path a key
+-- assignment uses.
+local function apply_window_mode(window, mode, pane)
+    if mode == "maximized" then
+        return maximize(window)
+    end
+    if mode == "fullscreen" then
+        return pcall(function()
+            window:perform_action(wezterm.action.ToggleFullScreen, pane)
+        end)
+    end
+    return true
+end
+
+-- A maximize or fullscreen transition changes the cell grid after the call
+-- returns. Poll in short steps for the saved grid; give up after about three
+-- seconds so a monitor or DPI change cannot stall the restore forever.
+local MODE_GRID_POLL_ATTEMPTS = 30
+local MODE_GRID_POLL_DELAY = 0.1
+
+local function pane_dimensions(pane)
+    if pane == nil then
+        return nil, nil
+    end
+    local ok, cols, rows = pcall(function()
+        return pane:get_dimensions()
+    end)
+    if not ok then
+        return nil, nil
+    end
+    return cols, rows
+end
+
+local function wait_for_grid(pane, cols, rows, done)
+    local attempts = 0
+    local function poll()
+        local actual_cols, actual_rows = pane_dimensions(pane)
+        if actual_cols == cols and actual_rows == rows then
+            done(true, actual_cols, actual_rows)
+            return
+        end
+        if attempts >= MODE_GRID_POLL_ATTEMPTS then
+            done(false, actual_cols, actual_rows)
+            return
+        end
+        attempts = attempts + 1
+        local scheduled = pcall(wezterm.time.call_after, MODE_GRID_POLL_DELAY, poll)
+        if not scheduled then
+            done(false, actual_cols, actual_rows)
+        end
+    end
+    poll()
+end
+
 local STATUS_CLEAR_SECONDS = 4
 local SELFCHECK_KINDS_SHOWN = 3
 -- Production waits about ten seconds in short steps: a cold first pwsh prompt
@@ -612,7 +684,9 @@ end
 -- latest is the state on_gui_startup read, or nil when there is none. pinned is
 -- true when latest came from the pinned file, which never expires. restore
 -- itself never reads the disk, so the decision logic is testable with a fake
--- mux. It returns true only when the saved layout was rebuilt.
+-- mux. It returns true when the restore was accepted: a normal window rebuilds
+-- before returning, while a saved maximize or fullscreen returns true and
+-- rebuilds once the grid settles.
 function M.restore(cmd, latest, pinned)
     if type(latest) ~= "table" then
         log.warn("restore.no_state")
@@ -712,112 +786,151 @@ function M.restore(cmd, latest, pinned)
         return fallback(cmd)
     end
 
-    local tab_objects = {}
-    local built, build_err = pcall(function()
-        for tab_index, plan in ipairs(plans) do
-            local tab
-            local pane
-            if tab_index == 1 then
-                tab, pane = spawned_tab, spawned_pane
-            else
-                local tab_root_saved = plan.saved.panes[first_leaf(plan.tree)]
-                local tab_args = { cwd = tab_root_saved.cwd }
-                with_history_env(tab_args, tab_root_saved)
-                local tab_ok, new_tab, new_pane = pcall(window.spawn_tab, window, tab_args)
-                if not tab_ok or new_tab == nil or new_pane == nil then
-                    error("tab " .. tab_index .. " spawn failed: " .. tostring(new_tab))
-                end
-                tab, pane = new_tab, new_pane
-            end
-            tab_objects[tab_index] = tab
+    local mode = saved_window_mode(latest.window)
 
-            if type(plan.saved.title) == "string" then
-                local titled = pcall(tab.set_title, tab, plan.saved.title)
-                if not titled then
-                    log.warn("restore.title_failed", { tab = tab_index })
+    -- Everything after the spawn lives here so the mode path can run it once
+    -- the grid settles. It returns true only when the layout was rebuilt.
+    local function build()
+        local tab_objects = {}
+        local built, build_err = pcall(function()
+            for tab_index, plan in ipairs(plans) do
+                local tab
+                local pane
+                if tab_index == 1 then
+                    tab, pane = spawned_tab, spawned_pane
+                else
+                    local tab_root_saved = plan.saved.panes[first_leaf(plan.tree)]
+                    local tab_args = { cwd = tab_root_saved.cwd }
+                    with_history_env(tab_args, tab_root_saved)
+                    local tab_ok, new_tab, new_pane = pcall(window.spawn_tab, window, tab_args)
+                    if not tab_ok or new_tab == nil or new_pane == nil then
+                        error("tab " .. tab_index .. " spawn failed: " .. tostring(new_tab))
+                    end
+                    tab, pane = new_tab, new_pane
                 end
-            end
+                tab_objects[tab_index] = tab
 
-            local created, expected, by_leaf = M.replay(pane, plan.tree, plan.saved.panes)
-            if created == nil then
-                error("tab " .. tab_index .. " replay failed: " .. tostring(expected))
+                if type(plan.saved.title) == "string" then
+                    local titled = pcall(tab.set_title, tab, plan.saved.title)
+                    if not titled then
+                        log.warn("restore.title_failed", { tab = tab_index })
+                    end
+                end
+
+                local created, expected, by_leaf = M.replay(pane, plan.tree, plan.saved.panes)
+                if created == nil then
+                    error("tab " .. tab_index .. " replay failed: " .. tostring(expected))
+                end
+                plan.by_leaf = by_leaf
             end
-            plan.by_leaf = by_leaf
+        end)
+
+        if not built then
+            log.error("restore.failed", { error = tostring(build_err) })
+            maximize(window)
+            flash_status(window, " restore failed ")
+            return false
         end
-    end)
 
-    if not built then
-        log.error("restore.failed", { error = tostring(build_err) })
-        maximize(window)
-        flash_status(window, " restore failed ")
-        return false
-    end
-
-    for tab_index, plan in ipairs(plans) do
-        for leaf, saved_pane in ipairs(plan.saved.panes) do
-            local foreground = saved_pane.foreground
-            if
-                foreground ~= nil
-                and foreground.alt_screen == true
-                and type(foreground.argv) == "table"
-                and #foreground.argv > 0
-            then
-                local pane_object = plan.by_leaf[leaf]
-                if pane_object ~= nil then
-                    local scheduled = pcall(
-                        schedule_foreground,
-                        pane_object,
-                        foreground.argv,
-                        saved_pane.id,
-                        tab_index
-                    )
-                    if not scheduled then
-                        log.warn("restore.foreground_failed", {
-                            tab = tab_index,
-                            pane = saved_pane.id,
-                        })
+        for tab_index, plan in ipairs(plans) do
+            for leaf, saved_pane in ipairs(plan.saved.panes) do
+                local foreground = saved_pane.foreground
+                if
+                    foreground ~= nil
+                    and foreground.alt_screen == true
+                    and type(foreground.argv) == "table"
+                    and #foreground.argv > 0
+                then
+                    local pane_object = plan.by_leaf[leaf]
+                    if pane_object ~= nil then
+                        local scheduled = pcall(
+                            schedule_foreground,
+                            pane_object,
+                            foreground.argv,
+                            saved_pane.id,
+                            tab_index
+                        )
+                        if not scheduled then
+                            log.warn("restore.foreground_failed", {
+                                tab = tab_index,
+                                pane = saved_pane.id,
+                            })
+                        end
                     end
                 end
             end
         end
-    end
 
-    local active_tab_object = tab_objects[active_tab]
-    if active_tab_object ~= nil then
-        pcall(active_tab_object.activate, active_tab_object)
-    end
-    local active_pane_object = plans[active_tab].by_leaf[active_leaf]
-    if active_pane_object ~= nil then
-        pcall(active_pane_object.activate, active_pane_object)
-    end
-
-    local report = { tabs = {} }
-    for tab_index, plan in ipairs(plans) do
-        local expected_tab = {
-            tab = tab_objects[tab_index],
-            title = plan.saved.title,
-            panes = {},
-        }
-        for leaf, saved_pane in ipairs(plan.saved.panes) do
-            expected_tab.panes[leaf] = {
-                id = saved_pane.id,
-                rect = saved_pane.rect,
-                cwd = saved_pane.cwd,
-                pane = plan.by_leaf[leaf],
-            }
+        local active_tab_object = tab_objects[active_tab]
+        if active_tab_object ~= nil then
+            pcall(active_tab_object.activate, active_tab_object)
         end
-        report.tabs[tab_index] = expected_tab
+        local active_pane_object = plans[active_tab].by_leaf[active_leaf]
+        if active_pane_object ~= nil then
+            pcall(active_pane_object.activate, active_pane_object)
+        end
+
+        local report = { tabs = {} }
+        for tab_index, plan in ipairs(plans) do
+            local expected_tab = {
+                tab = tab_objects[tab_index],
+                title = plan.saved.title,
+                panes = {},
+            }
+            for leaf, saved_pane in ipairs(plan.saved.panes) do
+                expected_tab.panes[leaf] = {
+                    id = saved_pane.id,
+                    rect = saved_pane.rect,
+                    cwd = saved_pane.cwd,
+                    pane = plan.by_leaf[leaf],
+                }
+            end
+            report.tabs[tab_index] = expected_tab
+        end
+
+        -- A self-check problem is logged but never escalates into a fallback: the
+        -- layout is already usable and a broken status area must not lose it.
+        local settle_steps = selfcheck_settle_steps()
+        local wired = pcall(check_selfcheck, window, report, 0, settle_steps)
+        if not wired then
+            log.warn("selfcheck.failed", { error = "self-check wiring raised" })
+        end
+
+        log.info("restore.done", { tabs = tab_count, active_tab = active_tab })
+        return true
     end
 
-    -- A self-check problem is logged but never escalates into a fallback: the
-    -- layout is already usable and a broken status area must not lose it.
-    local settle_steps = selfcheck_settle_steps()
-    local wired = pcall(check_selfcheck, window, report, 0, settle_steps)
-    if not wired then
-        log.warn("selfcheck.failed", { error = "self-check wiring raised" })
+    if mode == "normal" then
+        return build()
     end
 
-    log.info("restore.done", { tabs = tab_count, active_tab = active_tab })
+    local applied = apply_window_mode(window, mode, spawned_pane)
+    if applied then
+        log.info("restore.mode_applied", { mode = mode })
+    else
+        log.warn("restore.mode_failed", { mode = mode })
+    end
+
+    -- Log the mismatch before any self-check can report drift, then rebuild on
+    -- whatever grid is live: a monitor or DPI change must not cost the layout.
+    local function replay_when_settled(matched, actual_cols, actual_rows)
+        if not matched then
+            log.warn("restore.mode_grid_mismatch", {
+                expected_cols = latest.window.cols,
+                expected_rows = latest.window.rows,
+                actual_cols = actual_cols,
+                actual_rows = actual_rows,
+            })
+        end
+        local build_ok, build_error = pcall(build)
+        if not build_ok then
+            log.error("restore.failed", { error = tostring(build_error) })
+            maximize(window)
+            flash_status(window, " restore failed ")
+        end
+    end
+
+    wait_for_grid(spawned_pane, latest.window.cols, latest.window.rows, replay_when_settled)
     return true
 end
 

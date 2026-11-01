@@ -374,6 +374,18 @@ return {
             local f = sample_state("1700000000-00aa01", 1700000000)
             f.tabs[1].panes[1].cwd = "C:\\elsewhere"
             t.ok(state.fingerprint(a) ~= state.fingerprint(f), "a cwd change must change the fingerprint")
+
+            local explicit_normal = sample_state("1700000000-00aa01", 1700000000)
+            explicit_normal.window.mode = "normal"
+            t.eq(
+                state.fingerprint(a),
+                state.fingerprint(explicit_normal),
+                "a missing mode and an explicit normal must fingerprint alike"
+            )
+
+            local maximized = sample_state("1700000000-00aa01", 1700000000)
+            maximized.window.mode = "maximized"
+            t.ok(state.fingerprint(a) ~= state.fingerprint(maximized), "a mode change must change the fingerprint")
         end,
     },
     {
@@ -407,6 +419,52 @@ return {
                 t.ok(state.validate(zero), "pane id 0 must be accepted")
                 t.ok(state.write(zero), "a state with active pane 0 must be writable")
                 t.eq(state.read(zero.instance.id), zero)
+            end)
+        end,
+    },
+    {
+        name = "a missing window mode means normal and keeps old states and pins valid",
+        run = function(t)
+            with_state_dir("mode-missing", function()
+                local old = sample_state("1700000000-00aa10", 1700000000)
+                t.eq(old.window.mode, nil, "the sample predates the mode field")
+                t.ok(state.validate(old), "a state without a mode must validate")
+                t.ok(state.write(old), "an old state must still be writable")
+                t.eq(state.read(old.instance.id), old, "an old state must round-trip unchanged")
+
+                local pin = pinned_state("1700000000-00aa11", 1700000000, 1700000000)
+                t.eq(pin.window.mode, nil)
+                t.ok(state.write_pinned(pin), "an old pin without a mode must stay valid")
+                t.eq(state.read_pinned(), pin)
+            end)
+        end,
+    },
+    {
+        name = "window mode accepts normal, maximized and fullscreen and rejects anything else",
+        run = function(t)
+            with_state_dir("mode-values", function()
+                for index, mode in ipairs({ "normal", "maximized", "fullscreen" }) do
+                    local value = sample_state(string.format("1700000000-00aa2%d", index), 1700000000)
+                    value.window.mode = mode
+                    t.ok(state.validate(value), mode .. " must validate")
+                    t.ok(state.write(value), mode .. " must be writable")
+                    t.eq(state.read(value.instance.id).window.mode, mode, mode .. " must round-trip")
+                end
+
+                for _, bad in ipairs({ "zoomed", "Normal", "max", "" }) do
+                    local value = sample_state("1700000000-00aa30", 1700000000)
+                    value.window.mode = bad
+                    t.eq(state.validate(value), false, "mode " .. bad .. " must be rejected")
+                end
+                for _, bad in ipairs({ 1, true, {} }) do
+                    local value = sample_state("1700000000-00aa31", 1700000000)
+                    value.window.mode = bad
+                    t.eq(state.validate(value), false, "a non-string mode must be rejected")
+                end
+
+                local refused = sample_state("1700000000-00aa32", 1700000000)
+                refused.window.mode = "zoomed"
+                t.eq(state.write(refused), false, "a bad mode must not be written")
             end)
         end,
     },

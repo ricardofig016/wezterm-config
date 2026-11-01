@@ -221,6 +221,7 @@ local function new_fake_env(options)
         tabs = {},
         panes = {},
         windows = {},
+        order = {},
     }
 
     local function make_pane(pane_options)
@@ -228,6 +229,7 @@ local function new_fake_env(options)
         local pane = {
             ready_at = pane_options.ready_at,
             info_calls = 0,
+            dimension_calls = 0,
             texts = {},
             activations = 0,
             splits = {},
@@ -236,9 +238,21 @@ local function new_fake_env(options)
             if pane_options.split_raises then
                 error("split refused")
             end
+            env.order[#env.order + 1] = "split"
             local child = make_pane(pane_options)
             self.splits[#self.splits + 1] = { args = args, child = child }
             return child
+        end
+        -- A real pane reports cols, viewport_rows and more. Tests supply either
+        -- one fixed pair or a list of steps, so a grid can settle after a poll.
+        function pane:get_dimensions()
+            self.dimension_calls = self.dimension_calls + 1
+            local steps = pane_options.dimensions
+            if type(steps) == "table" and #steps > 0 then
+                local step = steps[math.min(self.dimension_calls, #steps)]
+                return step.cols, step.rows
+            end
+            return pane_options.cols, pane_options.rows
         end
         function pane:get_foreground_process_info()
             self.info_calls = self.info_calls + 1
@@ -269,7 +283,12 @@ local function new_fake_env(options)
     end
 
     local function make_window()
-        local window = { maximized = 0, spawn_tab_calls = {}, statuses = {} }
+        local window = {
+            maximized = 0,
+            spawn_tab_calls = {},
+            statuses = {},
+            perform_actions = {},
+        }
         function window:spawn_tab(args)
             local tab = make_tab()
             local pane = make_pane()
@@ -279,6 +298,13 @@ local function new_fake_env(options)
             env.panes[#env.panes + 1] = pane
             return tab, pane, window
         end
+        function window:perform_action(action, pane)
+            window.perform_actions[#window.perform_actions + 1] = {
+                action = action,
+                pane = pane,
+            }
+            env.order[#env.order + 1] = "fullscreen"
+        end
         function window:gui_window()
             if env.status_raises then
                 error("no status area")
@@ -286,6 +312,7 @@ local function new_fake_env(options)
             return {
                 maximize = function()
                     window.maximized = window.maximized + 1
+                    env.order[#env.order + 1] = "maximize"
                 end,
                 set_right_status = function(_, text)
                     window.statuses[#window.statuses + 1] = text
@@ -893,6 +920,171 @@ return {
 
                 t.ok(find_event(events, "restore.start") ~= nil)
                 t.ok(find_event(events, "restore.done") ~= nil)
+            end)
+        end,
+    },
+    {
+        name = "a normal window is not maximized and the grid is not polled",
+        run = function(t)
+            local normal = sample_restore_state({
+                window = { cols = 200, rows = 50, active_tab = 2, active_pane = 21, mode = "normal" },
+            })
+            t.ok(state.validate(normal), "an explicit normal mode must validate")
+            with_restore_env({}, function(env, events)
+                local calls = 0
+                with_stub(layout, "selfcheck", function()
+                    calls = calls + 1
+                    return {}
+                end, function()
+                    t.eq(layout.restore(nil, normal), true)
+                end)
+                t.eq(env.spawn.window.maximized, 0, "a normal window must not be maximized")
+                t.eq(env.spawn.window.perform_actions, {}, "a normal window must not toggle fullscreen")
+                t.eq(env.spawn.pane.dimension_calls, 0, "a normal restore must not wait for a mode")
+                t.eq(#env.spawn.pane.splits, 1, "the splits must replay as before")
+                t.eq(find_event(events, "restore.mode_applied"), nil)
+                t.eq(find_event(events, "restore.mode_grid_mismatch"), nil)
+                t.eq(env.spawn.window.statuses, {})
+            end)
+        end,
+    },
+    {
+        name = "an old state without a mode restores as a normal window",
+        run = function(t)
+            local old = sample_restore_state()
+            t.eq(old.window.mode, nil, "a pre-mode state carries no mode")
+            t.ok(state.validate(old), "a missing mode must stay valid")
+            with_restore_env({}, function(env, events)
+                with_stub(layout, "selfcheck", function()
+                    return {}
+                end, function()
+                    t.eq(layout.restore(nil, old), true)
+                end)
+                t.eq(env.spawn.window.maximized, 0)
+                t.eq(env.spawn.window.perform_actions, {})
+                t.eq(env.spawn.pane.dimension_calls, 0)
+                t.eq(find_event(events, "restore.mode_applied"), nil)
+                t.ok(find_event(events, "restore.done") ~= nil)
+            end)
+        end,
+    },
+    {
+        name = "a maximized state maximizes before replaying on the matched grid",
+        run = function(t)
+            local maximized = sample_restore_state({
+                window = { cols = 200, rows = 50, active_tab = 2, active_pane = 21, mode = "maximized" },
+            })
+            with_restore_env({
+                pane_options = {
+                    dimensions = {
+                        { cols = 180, rows = 40 },
+                        { cols = 200, rows = 50 },
+                    },
+                },
+            }, function(env, events)
+                local calls = 0
+                with_stub(layout, "selfcheck", function()
+                    calls = calls + 1
+                    return {}
+                end, function()
+                    t.eq(layout.restore(nil, maximized), true)
+                end)
+                t.eq(env.spawn.window.maximized, 1, "the saved maximize must be applied once")
+                t.eq(env.spawn.window.perform_actions, {}, "maximize must not toggle fullscreen")
+                t.eq(env.spawn.pane.dimension_calls, 2, "the grid must be polled until it matches")
+                t.eq(#env.spawn.pane.splits, 1, "the splits must replay on the matched grid")
+                local applied = find_event(events, "restore.mode_applied")
+                t.ok(applied ~= nil)
+                t.eq(applied.level, "info")
+                t.eq(applied.fields.mode, "maximized")
+                t.eq(find_event(events, "restore.mode_grid_mismatch"), nil)
+                t.eq(find_event(events, "selfcheck.drift"), nil)
+                t.eq(env.spawn.window.statuses, {}, "a matched mode restore must stay silent")
+                t.eq(env.order[1], "maximize", "maximize must run before any replay")
+                local split_at
+                for index, step in ipairs(env.order) do
+                    if step == "split" then
+                        split_at = index
+                        break
+                    end
+                end
+                t.ok(split_at ~= nil and split_at > 1, "maximize must precede the first split")
+            end)
+        end,
+    },
+    {
+        name = "a fullscreen state performs the toggle before replaying on the matched grid",
+        run = function(t)
+            local fullscreen = sample_restore_state({
+                window = { cols = 200, rows = 50, active_tab = 2, active_pane = 21, mode = "fullscreen" },
+            })
+            with_restore_env({
+                pane_options = { dimensions = { { cols = 200, rows = 50 } } },
+            }, function(env, events)
+                with_stub(layout, "selfcheck", function()
+                    return {}
+                end, function()
+                    t.eq(layout.restore(nil, fullscreen), true)
+                end)
+                t.eq(env.spawn.window.maximized, 0, "fullscreen must not call maximize")
+                t.eq(#env.spawn.window.perform_actions, 1, "one ToggleFullScreen action")
+                t.eq(
+                    env.spawn.window.perform_actions[1].action,
+                    wezterm.action.ToggleFullScreen,
+                    "the action must be ToggleFullScreen"
+                )
+                t.ok(
+                    env.spawn.window.perform_actions[1].pane == env.spawn.pane,
+                    "the action must be performed for the spawned pane"
+                )
+                t.eq(env.spawn.pane.dimension_calls, 1)
+                t.eq(#env.spawn.pane.splits, 1)
+                local applied = find_event(events, "restore.mode_applied")
+                t.ok(applied ~= nil)
+                t.eq(applied.fields.mode, "fullscreen")
+                t.eq(env.order[1], "fullscreen", "the toggle must run before any replay")
+                t.eq(env.spawn.window.statuses, {})
+            end)
+        end,
+    },
+    {
+        name = "a grid that never matches replays and logs the mismatch before any drift",
+        run = function(t)
+            local maximized = sample_restore_state({
+                window = { cols = 200, rows = 50, active_tab = 2, active_pane = 21, mode = "maximized" },
+            })
+            with_restore_env({
+                pane_options = { dimensions = { { cols = 180, rows = 40 } } },
+            }, function(env, events)
+                with_stub(layout, "selfcheck", function()
+                    return { { kind = "rect", tab = 1, pane = 10 } }
+                end, function()
+                    t.eq(layout.restore(nil, maximized), true)
+                end)
+                t.eq(env.spawn.pane.dimension_calls, 31, "the grid wait must be bounded to about three seconds")
+                t.eq(#env.spawn.pane.splits, 1, "the layout must still be replayed on the current grid")
+                local mismatch = find_event(events, "restore.mode_grid_mismatch")
+                t.ok(mismatch ~= nil, "a grid that never matches must be logged")
+                t.eq(mismatch.level, "warn")
+                t.eq(mismatch.fields.expected_cols, 200)
+                t.eq(mismatch.fields.expected_rows, 50)
+                t.eq(mismatch.fields.actual_cols, 180)
+                t.eq(mismatch.fields.actual_rows, 40)
+                local drift = find_event(events, "selfcheck.drift")
+                t.ok(drift ~= nil, "the drift still reports")
+                local mismatch_index, drift_index
+                for index, event in ipairs(events) do
+                    if event.event == "restore.mode_grid_mismatch" and mismatch_index == nil then
+                        mismatch_index = index
+                    elseif event.event == "selfcheck.drift" and drift_index == nil then
+                        drift_index = index
+                    end
+                end
+                t.ok(
+                    mismatch_index ~= nil and drift_index ~= nil and mismatch_index < drift_index,
+                    "the mismatch must be logged before the drift and must not be suppressed by it"
+                )
+                t.eq(env.spawn.window.maximized, 1, "only the saved mode maximizes; no fallback")
             end)
         end,
     },

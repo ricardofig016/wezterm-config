@@ -7,6 +7,9 @@
 --   <state dir>\sessions\<instance id>.json       one file per live instance
 --   <state dir>\sessions\<instance id>.json.tmp   transient write target
 --
+-- window.mode is "normal", "maximized" or "fullscreen". Older files and pins
+-- predate the field, so a missing mode means "normal" and stays valid.
+--
 -- An instance writes only its own file, so two live instances can never
 -- overwrite each other. read_latest() lists the sessions folder with
 -- wezterm.read_dir, which this build provides, and returns the valid state with
@@ -21,6 +24,12 @@ local M = {}
 
 M.SCHEMA_VERSION = 1
 M.MAX_AGE_SECONDS = 604800
+
+local WINDOW_MODES = {
+    normal = true,
+    maximized = true,
+    fullscreen = true,
+}
 
 local DEFAULT_STATE_DIR = "C:\\Users\\rfigueiredo\\AppData\\Roaming\\wezterm-session-layer"
 local SESSION_SUFFIX = ".json"
@@ -232,6 +241,11 @@ function M.validate(t)
     if not is_non_negative_integer(window.cols) or not is_non_negative_integer(window.rows) then
         return false
     end
+    -- A missing mode is an older state and means a normal window. Any present
+    -- value must be one of the three modes, so a typo never reaches restore.
+    if window.mode ~= nil and WINDOW_MODES[window.mode] ~= true then
+        return false
+    end
     if not is_integer(window.active_tab) or window.active_tab < 1 then
         return false
     end
@@ -362,7 +376,7 @@ end
 
 -- Stable across a save that only changes saved_at (and instance), so the
 -- change detector can compare fingerprints instead of tables. Covers the
--- window cell size with its active tab and pane, plus every tab title, pane
+-- window cell size, mode, active tab and pane, plus every tab title, pane
 -- id, rectangle and cwd.
 function M.fingerprint(t)
     if type(t) ~= "table" then
@@ -372,11 +386,14 @@ function M.fingerprint(t)
     local window = t.window
     if type(window) == "table" then
         parts[#parts + 1] = string.format(
-            "w=%s,%s,%s,%s",
+            "w=%s,%s,%s,%s,%s",
             tostring(window.cols),
             tostring(window.rows),
             tostring(window.active_tab),
-            tostring(window.active_pane)
+            tostring(window.active_pane),
+            -- Normalize a missing mode to "normal" so an old state and a state
+            -- that records the same mode explicitly fingerprint alike.
+            tostring(window.mode or "normal")
         )
     end
     if type(t.tabs) == "table" then
