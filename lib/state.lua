@@ -1,17 +1,21 @@
--- Schema version 1: one state file per live instance under a sessions folder.
+-- Schema version 1: one state file per live instance under a sessions folder,
+-- plus an optional pinned layout that always wins restore and never expires.
 --
 -- Layout (cells everywhere; pane rectangles are tab-relative from 0,0):
 --
+--   <state dir>\pinned.json                      optional pinned layout
 --   <state dir>\sessions\<instance id>.json       one file per live instance
 --   <state dir>\sessions\<instance id>.json.tmp   transient write target
 --
 -- An instance writes only its own file, so two live instances can never
 -- overwrite each other. read_latest() lists the sessions folder with
 -- wezterm.read_dir, which this build provides, and returns the valid state with
--- the newest saved_at. There is no pointer or index file; a crash can only
--- leave a .json.tmp behind, which the next save of that instance truncates and
--- overwrites. instance_id() is memoized, so repeated saves reuse one file.
+-- the newest saved_at. Pinned.json is never part of that listing. There is no
+-- pointer or index file; a crash can only leave a .json.tmp behind, which the
+-- next save of that instance truncates and overwrites. instance_id() is
+-- memoized, so repeated saves reuse one file.
 local wezterm = require("wezterm")
+local log = require("lib.log")
 
 local M = {}
 
@@ -21,6 +25,8 @@ M.MAX_AGE_SECONDS = 604800
 local DEFAULT_STATE_DIR = "C:\\Users\\rfigueiredo\\AppData\\Roaming\\wezterm-session-layer"
 local SESSION_SUFFIX = ".json"
 local TMP_SUFFIX = ".tmp"
+local PINNED_NAME = "pinned.json"
+local SESSION_KEEP = 3
 
 local function env(name)
     local ok, value = pcall(os.getenv, name)
@@ -48,6 +54,10 @@ end
 
 function M.path(id)
     return M.sessions_dir() .. "\\" .. tostring(id) .. SESSION_SUFFIX
+end
+
+function M.pinned_path()
+    return M.state_dir() .. "\\" .. PINNED_NAME
 end
 
 -- mkdir is not exposed by the sandbox Lua API, so fall back to cmd when the
@@ -96,6 +106,7 @@ end
 
 -- Every full path of the session files, sorted for determinism. read_dir
 -- raises when the folder does not exist yet, which just means "no state".
+-- pinned.json lives beside sessions\, not inside it, and is never included.
 local function list_session_files()
     local dir = M.sessions_dir()
     local files = {}
@@ -106,7 +117,7 @@ local function list_session_files()
     for _, entry in ipairs(entries) do
         local text = tostring(entry)
         local name = text:match("([^\\/]+)$") or text
-        if name:sub(-#SESSION_SUFFIX) == SESSION_SUFFIX then
+        if name:sub(-#SESSION_SUFFIX) == SESSION_SUFFIX and name:lower() ~= PINNED_NAME then
             if text:find("[\\/]") then
                 files[#files + 1] = text
             else
@@ -258,6 +269,54 @@ function M.validate(t)
     return true
 end
 
+local function valid_pinned(t)
+    return M.validate(t) and is_non_negative_integer(t.pinned_at)
+end
+
+-- A pin never expires on its own: deliberately no is_stale check here.
+function M.read_pinned()
+    local path = M.pinned_path()
+    if not file_exists(path) then
+        return nil
+    end
+    local value = parse_path(path)
+    if value == nil or not valid_pinned(value) then
+        return nil, "invalid"
+    end
+    return value
+end
+
+-- The suite sets WEZTERM_SESSION_TEST=1 on every launch. If a test forgets its
+-- state-directory override, refuse the write instead of touching real state.
+local function test_write_blocked()
+    if env("WEZTERM_SESSION_TEST") ~= "1" then
+        return nil
+    end
+    if env("WEZTERM_SESSION_STATE_DIR") ~= nil then
+        return nil
+    end
+    return "refusing to write the real state directory while WEZTERM_SESSION_TEST=1; "
+        .. "set WEZTERM_SESSION_STATE_DIR"
+end
+
+local function guard_write(target)
+    local reason = test_write_blocked()
+    if reason == nil then
+        return nil
+    end
+    log.warn("save.blocked", { path = tostring(target), reason = reason })
+    return reason
+end
+
+-- Returns whether a pin existed and was removed.
+function M.unpin()
+    local path = M.pinned_path()
+    if not file_exists(path) then
+        return false
+    end
+    return os.remove(path) ~= nil
+end
+
 function M.read(id)
     if id == nil or id == "" then
         return nil
@@ -361,26 +420,11 @@ function M.empty()
     }
 end
 
-function M.prune(now)
-    now = now or os.time()
-    local removed = 0
-    for _, file in ipairs(list_session_files()) do
-        local value = parse_path(file)
-        if value and M.validate(value) and M.is_stale(value, now) then
-            if os.remove(file) then
-                removed = removed + 1
-            end
-        end
-    end
-    return removed
+local function parent_dir(path)
+    return tostring(path):match("^(.*)[\\/][^\\/]*$")
 end
 
-function M.write(t)
-    if not M.validate(t) then
-        return false
-    end
-
-    local final_path = M.path(t.instance.id)
+local function write_atomic(t, final_path, validator)
     local tmp_path = final_path .. TMP_SUFFIX
 
     local ok, text = pcall(wezterm.json_encode, t)
@@ -390,7 +434,7 @@ function M.write(t)
 
     local handle = io.open(tmp_path, "w")
     if not handle then
-        ensure_dir(M.sessions_dir())
+        ensure_dir(parent_dir(tmp_path))
         handle = io.open(tmp_path, "w")
     end
     if not handle then
@@ -418,7 +462,7 @@ function M.write(t)
         return false
     end
     local parsed = parse_text(fresh)
-    if parsed == nil or parsed.version ~= M.SCHEMA_VERSION or not M.validate(parsed) then
+    if parsed == nil or parsed.version ~= M.SCHEMA_VERSION or not validator(parsed) then
         os.remove(tmp_path)
         return false
     end
@@ -438,5 +482,59 @@ function M.write(t)
     end
     return true
 end
+
+-- Keep the three newest session files no matter how old they are; only stale
+-- files beyond that are removed. pinned.json is not in the sessions listing.
+function M.prune(now)
+    now = now or os.time()
+    local entries = {}
+    for _, file in ipairs(list_session_files()) do
+        local value = parse_path(file)
+        if value and M.validate(value) then
+            entries[#entries + 1] = { file = file, state = value }
+        end
+    end
+    table.sort(entries, function(a, b)
+        if a.state.saved_at ~= b.state.saved_at then
+            return a.state.saved_at > b.state.saved_at
+        end
+        return tostring(a.state.instance.id) > tostring(b.state.instance.id)
+    end)
+
+    local removed = 0
+    for index, entry in ipairs(entries) do
+        if index > SESSION_KEEP and M.is_stale(entry.state, now) then
+            if os.remove(entry.file) then
+                removed = removed + 1
+            end
+        end
+    end
+    return removed
+end
+
+function M.write(t)
+    if not M.validate(t) then
+        return false
+    end
+    local final_path = M.path(t.instance.id)
+    local blocked = guard_write(final_path)
+    if blocked ~= nil then
+        return false, blocked
+    end
+    return write_atomic(t, final_path, M.validate)
+end
+
+function M.write_pinned(t)
+    if not valid_pinned(t) then
+        return false, "pinned state must be a valid version 1 state with an integer pinned_at"
+    end
+    local final_path = M.pinned_path()
+    local blocked = guard_write(final_path)
+    if blocked ~= nil then
+        return false, blocked
+    end
+    return write_atomic(t, final_path, valid_pinned)
+end
+
 
 return M

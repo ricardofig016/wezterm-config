@@ -125,6 +125,12 @@ local function sample_state(id, saved_at)
     }
 end
 
+local function pinned_state(id, saved_at, pinned_at)
+    local value = sample_state(id, saved_at)
+    value.pinned_at = pinned_at or saved_at
+    return value
+end
+
 return {
     {
         name = "state directory honours WEZTERM_SESSION_STATE_DIR and its pinned fallback",
@@ -313,19 +319,25 @@ return {
         end,
     },
     {
-        name = "prune removes stale states and leaves fresh and unreadable files alone",
+        name = "prune keeps the three newest sessions and leaves unreadable files alone",
         run = function(t)
             with_state_dir("prune", function()
                 local now = 1700001000
-                local stale = sample_state("1600000000-0000aa", now - state.MAX_AGE_SECONDS - 10)
-                local fresh = sample_state("1700001000-0000bb", now - 60)
-                local corrupt_id = "1700000900-0000cc"
-                t.ok(state.write(stale))
-                t.ok(state.write(fresh))
+                local newest = sample_state("1700001000-0000bb", now - 10)
+                local second = sample_state("1700000990-0000cc", now - 20)
+                local stale_third = sample_state("1600000000-0000dd", now - state.MAX_AGE_SECONDS - 100)
+                local stale_fourth = sample_state("1500000000-0000ee", now - state.MAX_AGE_SECONDS - 200)
+                local corrupt_id = "1700000900-0000ff"
+                t.ok(state.write(newest))
+                t.ok(state.write(second))
+                t.ok(state.write(stale_third))
+                t.ok(state.write(stale_fourth))
                 write_raw(state.path(corrupt_id), "{")
-                t.eq(state.prune(now), 1, "exactly the stale state must be removed")
-                t.eq(state.read(stale.instance.id), nil, "the stale file must be gone")
-                t.ok(state.read(fresh.instance.id) ~= nil, "the fresh file must stay")
+                t.eq(state.prune(now), 1, "only the stale file beyond the three newest may be removed")
+                t.ok(state.read(newest.instance.id) ~= nil)
+                t.ok(state.read(second.instance.id) ~= nil)
+                t.ok(state.read(stale_third.instance.id) ~= nil, "the third newest survives however old it is")
+                t.eq(state.read(stale_fourth.instance.id), nil)
                 t.ok(file_exists(state.path(corrupt_id)), "an unreadable file is left for a human, not guessed at")
             end)
         end,
@@ -474,6 +486,126 @@ return {
                 t.ok(read_all(path):find("event=history.record", 1, true) ~= nil, "the new event must be in the fresh log")
                 t.ok(not file_exists(path .. ".2"), "only one backup is kept")
             end)
+        end,
+    },
+    {
+        name = "a pinned state round-trips and unpin reports absence",
+        run = function(t)
+            with_state_dir("pinned-roundtrip", function()
+                local pin = pinned_state("1700000000-00aa01", 1700000000, 1700000500)
+                t.ok(state.write_pinned(pin))
+                t.ok(file_exists(state.pinned_path()))
+                t.eq(state.read_pinned(), pin)
+                t.ok(state.unpin())
+                t.eq(state.read_pinned(), nil)
+                t.eq(state.unpin(), false, "unpinning an absent pin reports absence")
+            end)
+        end,
+    },
+    {
+        name = "pinned state is validated strictly and corrupt files are refused",
+        run = function(t)
+            with_state_dir("pinned-invalid", function()
+                local unstamped = sample_state("1700000000-00aa02", 1700000000)
+                t.eq(state.write_pinned(unstamped), false, "pinned_at is required")
+                local negative = pinned_state("1700000000-00aa03", 1700000000, -1)
+                t.eq(state.write_pinned(negative), false, "pinned_at must be non-negative")
+                local invalid = pinned_state("1700000000-00aa04", 1700000000, 1700000000)
+                invalid.window.active_pane = 999
+                t.eq(state.write_pinned(invalid), false, "the base state must still validate")
+                t.ok(not file_exists(state.pinned_path()), "no invalid pin may be written")
+
+                write_raw(state.pinned_path(), '{"version":1}')
+                local value, err = state.read_pinned()
+                t.eq(value, nil)
+                t.eq(err, "invalid", "a pin without pinned_at is corrupt")
+            end)
+        end,
+    },
+    {
+        name = "a pinned state never expires",
+        run = function(t)
+            with_state_dir("pinned-expiry", function()
+                local now = 1700001000
+                local pin = pinned_state("1600000000-00aa06", now - state.MAX_AGE_SECONDS - 1000, now)
+                t.ok(state.write_pinned(pin))
+                t.ok(state.is_stale(pin, now), "the saved layout is stale by the session rule")
+                t.eq(state.read_pinned(), pin, "the pin must still be readable")
+            end)
+        end,
+    },
+    {
+        name = "pinned.json is never treated as a session file",
+        run = function(t)
+            with_state_dir("pinned-selection", function()
+                local now = 1700001000
+                local pin = pinned_state("1700001000-00aa07", now, now)
+                local session = sample_state("1600000000-00aa08", now - 100)
+                t.ok(state.write_pinned(pin))
+                t.ok(state.write(session))
+                t.eq(state.read_latest().instance.id, session.instance.id, "read_latest must ignore the pin")
+                t.eq(state.prune(now), 0, "prune must not count or remove the pin")
+                t.eq(state.read_pinned(), pin)
+            end)
+        end,
+    },
+    {
+        name = "prune keeps the three newest sessions and never touches the pin",
+        run = function(t)
+            with_state_dir("pinned-prune", function()
+                local now = 1700001000
+                local pin = pinned_state("1500000000-00aa09", now - state.MAX_AGE_SECONDS * 2, now)
+                t.ok(state.write_pinned(pin))
+                local newest = sample_state("1700001000-00aa0a", now - 10)
+                local second = sample_state("1700000990-00aa0b", now - 20)
+                local stale_third = sample_state("1600000000-00aa0c", now - state.MAX_AGE_SECONDS - 100)
+                local stale_fourth = sample_state("1500000000-00aa0d", now - state.MAX_AGE_SECONDS - 200)
+                t.ok(state.write(newest))
+                t.ok(state.write(second))
+                t.ok(state.write(stale_third))
+                t.ok(state.write(stale_fourth))
+                t.eq(state.prune(now), 1)
+                t.ok(file_exists(state.pinned_path()), "the pin is never pruned")
+                t.eq(state.read_pinned(), pin)
+                t.ok(state.read(stale_third.instance.id) ~= nil, "the third newest survives")
+                t.eq(state.read(stale_fourth.instance.id), nil)
+            end)
+        end,
+    },
+    {
+        name = "the test guard refuses writes without a state override",
+        run = function(t)
+            local real_getenv = os.getenv
+            local real_warn = log.warn
+            local blocked = {}
+            os.getenv = function(name)
+                if name == "WEZTERM_SESSION_TEST" then
+                    return "1"
+                end
+                if name == "WEZTERM_SESSION_STATE_DIR" then
+                    return nil
+                end
+                return real_getenv(name)
+            end
+            log.warn = function(event, fields)
+                if event == "save.blocked" then
+                    blocked[#blocked + 1] = fields
+                end
+                return true
+            end
+
+            local write_ok, write_err = state.write(sample_state("1700000000-00aa0e", 1700000000))
+            local pin_ok, pin_err = state.write_pinned(pinned_state("1700000000-00aa0f", 1700000000, 1700000000))
+
+            os.getenv = real_getenv
+            log.warn = real_warn
+
+            t.eq(write_ok, false)
+            t.ok(type(write_err) == "string" and write_err:find("WEZTERM_SESSION_STATE_DIR", 1, true) ~= nil)
+            t.eq(pin_ok, false)
+            t.ok(type(pin_err) == "string" and pin_err:find("WEZTERM_SESSION_STATE_DIR", 1, true) ~= nil)
+            t.eq(#blocked, 2, "both refused writes must log save.blocked")
+            t.ok(type(blocked[1].path) == "string")
         end,
     },
 }

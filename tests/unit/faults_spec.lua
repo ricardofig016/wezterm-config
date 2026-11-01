@@ -384,26 +384,30 @@ return {
         end,
     },
     {
-        name = "pruning removes only stale files and never the newer one",
+        name = "pruning keeps the three newest and removes only stale files beyond them",
         run = function(t)
             with_state_dir(function()
                 local now = os.time()
-                local old = sample_state("1700000300-0000cc", now - state.MAX_AGE_SECONDS - 10)
+                local oldest_stale = sample_state("1700000300-0000cc", now - state.MAX_AGE_SECONDS - 10)
                 local fresh = sample_state("1700000400-0000dd", now - 10)
-                t.ok(state.write(old))
+                t.ok(state.write(oldest_stale))
                 t.ok(state.write(fresh))
-                t.eq(state.prune(now), 1, "only the stale file may be removed")
-                t.eq(state.read(old.instance.id), nil)
-                t.eq(state.read(fresh.instance.id), fresh)
-                t.eq(state.read_latest().instance.id, fresh.instance.id)
+                t.eq(state.prune(now), 0, "fewer than three sessions cannot be pruned")
+                t.ok(state.read(oldest_stale.instance.id) ~= nil)
 
                 local older_fresh = sample_state("1700000500-0000ee", now - 20)
                 local newer_fresh = sample_state("1700000501-0000ff", now - 5)
+                local stale_third = sample_state("1600000000-0000ab", now - state.MAX_AGE_SECONDS - 50)
                 t.ok(state.write(older_fresh))
                 t.ok(state.write(newer_fresh))
-                t.eq(state.prune(now), 0, "no fresh file may be pruned")
+                t.ok(state.write(stale_third))
+                -- Five valid sessions: the three newest survive, the two stale
+                -- ones beyond them are removed.
+                t.eq(state.prune(now), 2, "stale files beyond the three newest are removed")
+                t.eq(state.read(oldest_stale.instance.id), nil)
+                t.eq(state.read(stale_third.instance.id), nil)
                 t.eq(state.read_latest().instance.id, newer_fresh.instance.id)
-                t.eq(state.read(older_fresh.instance.id), older_fresh, "the older fresh file stays")
+                t.ok(state.read(older_fresh.instance.id) ~= nil, "the third newest survives")
             end)
         end,
     },
