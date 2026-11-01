@@ -59,6 +59,12 @@ if ($Jobs -lt 1) {
 $isRunnerChild = $env:WEZTERM_SESSION_RUNNER_CHILD -eq '1'
 $script:runTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
+# Every process this runner launches, including wezterm-gui and the headless
+# harness, sees this marker. The state writer refuses the real user directory
+# when it is set without an explicit override, so a forgotten test override fails
+# loudly instead of silently writing the user's session.
+$env:WEZTERM_SESSION_TEST = '1'
+
 $script:suiteExit = 1
 $script:scenarioPassed = $false
 
@@ -997,6 +1003,81 @@ function Invoke-AllSuites {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Real state directory guard.
+#
+# The suite must never read or write %APPDATA%\wezterm-session-layer. Fingerprint
+# it before and after every run and fail loudly on any creation, removal or
+# entry change. This is the permanent version of the near miss where an interim
+# unit test reached the real prune.
+# ---------------------------------------------------------------------------
+function Get-AppDataDirectory {
+    $appData = $env:APPDATA
+    if ([string]::IsNullOrWhiteSpace($appData)) {
+        $appData = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
+    }
+    return $appData
+}
+
+function Get-RealStateFingerprint {
+    $appData = Get-AppDataDirectory
+    $entries = @{}
+    if ([string]::IsNullOrWhiteSpace($appData)) {
+        return [pscustomobject]@{ Path = '<no APPDATA>'; Exists = $false; Entries = $entries }
+    }
+
+    $path = Join-Path $appData 'wezterm-session-layer'
+    if (-not (Test-Path -LiteralPath $path)) {
+        return [pscustomobject]@{ Path = $path; Exists = $false; Entries = $entries }
+    }
+
+    $root = (Resolve-Path -LiteralPath $path).Path
+    foreach ($item in @(Get-ChildItem -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue)) {
+        $relative = $item.FullName.Substring($root.Length).TrimStart('\', '/')
+        if ($item.PSIsContainer) {
+            $entries[$relative] = 'dir'
+        } else {
+            $entries[$relative] = ('file|{0}|{1}' -f $item.Length, $item.LastWriteTimeUtc.ToString('o'))
+        }
+    }
+    return [pscustomobject]@{ Path = $path; Exists = $true; Entries = $entries }
+}
+
+function Compare-RealStateFingerprint {
+    param($Before, $After)
+
+    if (-not $Before.Exists -and $After.Exists) {
+        return "the real state directory was created during the run: $($After.Path)"
+    }
+    if ($Before.Exists -and -not $After.Exists) {
+        return "the real state directory disappeared during the run: $($Before.Path)"
+    }
+    if (-not $Before.Exists) {
+        return $null
+    }
+
+    $changes = @()
+    foreach ($key in @($Before.Entries.Keys | Sort-Object)) {
+        if (-not $After.Entries.ContainsKey($key)) {
+            $changes += "removed $key"
+        } elseif ($Before.Entries[$key] -ne $After.Entries[$key]) {
+            $changes += ('changed {0} ({1} -> {2})' -f $key,
+                $Before.Entries[$key], $After.Entries[$key])
+        }
+    }
+    foreach ($key in @($After.Entries.Keys | Sort-Object)) {
+        if (-not $Before.Entries.ContainsKey($key)) {
+            $changes += "added $key"
+        }
+    }
+    if ($changes.Count -gt 0) {
+        return ("the real state directory changed during the run: " + ($changes -join '; '))
+    }
+    return $null
+}
+
+$realStateBefore = Get-RealStateFingerprint
+
 $lock = $null
 if (-not $isRunnerChild) {
     $lock = Acquire-RunLock -Path $runLockPath -Repo $repoRoot -Suites $selectionText
@@ -1007,40 +1088,34 @@ if (-not $isRunnerChild) {
 }
 $script:runLock = $lock
 
+$runFailed = $false
 try {
     if ($allBound -and [bool]$All) {
         $script:allFailed = $false
         Invoke-AllSuites
-        if ($script:allFailed) {
-            exit 1
+        $runFailed = [bool]$script:allFailed
+    } else {
+        $failedSuites = $false
+        if ($runUnit) {
+            Invoke-UnitSuite
+            if ($script:suiteExit -ne 0) {
+                $failedSuites = $true
+            }
         }
-        exit 0
-    }
-
-    $failedSuites = $false
-    if ($runUnit) {
-        Invoke-UnitSuite
-        if ($script:suiteExit -ne 0) {
-            $failedSuites = $true
+        if ($runShell) {
+            Invoke-ShellSuite
+            if ($script:suiteExit -ne 0) {
+                $failedSuites = $true
+            }
         }
-    }
-    if ($runShell) {
-        Invoke-ShellSuite
-        if ($script:suiteExit -ne 0) {
-            $failedSuites = $true
+        if ($runIntegration) {
+            Invoke-IntegrationSuite
+            if ($script:suiteExit -ne 0) {
+                $failedSuites = $true
+            }
         }
+        $runFailed = $failedSuites
     }
-    if ($runIntegration) {
-        Invoke-IntegrationSuite
-        if ($script:suiteExit -ne 0) {
-            $failedSuites = $true
-        }
-    }
-
-    if ($failedSuites) {
-        exit 1
-    }
-    exit 0
 } finally {
     if ($null -ne $script:runLock) {
         Release-RunLock -Path $runLockPath -Stream $script:runLock.Stream
@@ -1050,3 +1125,15 @@ try {
         Write-Output ("TIME total: {0:N1}s" -f $script:runTimer.Elapsed.TotalSeconds)
     }
 }
+
+$realStateAfter = Get-RealStateFingerprint
+$realStateChange = Compare-RealStateFingerprint -Before $realStateBefore -After $realStateAfter
+if ($null -ne $realStateChange) {
+    Write-Output ('FAIL proof: ' + $realStateChange)
+    exit 1
+}
+
+if ($runFailed) {
+    exit 1
+}
+exit 0
