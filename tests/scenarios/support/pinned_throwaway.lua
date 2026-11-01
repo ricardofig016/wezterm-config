@@ -78,6 +78,21 @@ end
 config.automatically_reload_config = false
 
 local state = require("lib.state")
+local save = require("lib.save")
+
+-- This process exists to produce exactly one newer session file, and the driver
+-- compares that file's saved_at with the value reported here. Give the change
+-- detector an hour-long debounce so a shell title or cwd that settles after the
+-- explicit save can never write a second time and move saved_at away from the
+-- reported value. Only save.save_now writes in this process.
+local LONG_DEBOUNCE_MS = 3600000
+local original_configure = save.configure
+save.configure = function()
+    local configured = original_configure()
+    save.DEBOUNCE_MS = LONG_DEBOUNCE_MS
+    return { debounce_ms = save.DEBOUNCE_MS, tick_ms = configured.tick_ms }
+end
+save.DEBOUNCE_MS = LONG_DEBOUNCE_MS
 
 wezterm.on("gui-startup", function(_cmd)
     support.await_window(10, function(_window, tab)
@@ -89,19 +104,32 @@ wezterm.on("gui-startup", function(_cmd)
                 write_result(false, "no pane to split")
                 return
             end
-            local ok, split_err = pcall(root.split, root, {
+            local split_ok, right = pcall(root.split, root, {
                 direction = "Right",
                 size = 25,
             })
-            if not ok or split_err == nil then
-                write_result(false, "split failed: " .. tostring(split_err))
+            if not split_ok or right == nil then
+                write_result(false, "split failed: " .. tostring(right))
                 return
             end
 
             local instance_id = state.instance_id()
-            local polls = 0
-            local function await_save()
-                polls = polls + 1
+
+            -- Wait for the split to reach the live grid before collecting the
+            -- state, then write exactly once through the explicit save path.
+            support.settle(tab, 5, function()
+                local gui_window = support.first_gui_window()
+                if gui_window == nil then
+                    write_result(false, "no GUI window for the explicit save")
+                    return
+                end
+
+                local saved_ok, saved = pcall(save.save_now, gui_window)
+                if not saved_ok or saved ~= true then
+                    write_result(false, "save.save_now failed: " .. tostring(saved))
+                    return
+                end
+
                 local snapshot = state.read(instance_id)
                 local count = 0
                 if snapshot ~= nil then
@@ -109,23 +137,21 @@ wezterm.on("gui-startup", function(_cmd)
                         count = count + #(pane_tab.panes or {})
                     end
                 end
-                if snapshot ~= nil
-                    and snapshot.saved_at > pinned_at
-                    and count > pinned_panes
-                then
+                if snapshot == nil then
+                    write_result(false, "no state after the explicit save")
+                    return
+                end
+                if snapshot.saved_at > pinned_at and count > pinned_panes then
                     write_result(true, "", snapshot)
                     return
                 end
-                if polls > 150 then
-                    write_result(false, string.format(
-                        "no newer save after 15s (saved_at=%s pinned_at=%s panes=%d pinned=%d)",
-                        snapshot ~= nil and tostring(snapshot.saved_at) or "nil",
-                        tostring(pinned_at), count, pinned_panes))
-                    return
-                end
-                wezterm.time.call_after(0.1, await_save)
-            end
-            wezterm.time.call_after(0.1, await_save)
+                write_result(false, string.format(
+                    "explicit save was not newer (%s): saved_at=%s pinned_at=%s panes=%d pinned=%d",
+                    tostring(saved), tostring(snapshot.saved_at), tostring(pinned_at),
+                    count, pinned_panes))
+            end, function(message)
+                write_result(false, "post-split settle failed: " .. tostring(message))
+            end)
         end, function(message)
             write_result(false, "layout settle failed: " .. tostring(message))
         end)
