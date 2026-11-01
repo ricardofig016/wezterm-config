@@ -5,10 +5,10 @@ The session layer is four session modules, the entry, and a shell hook.
 and restore, `lib\save.lua` owns the change detector, `lib\log.lua` owns the
 log, and `shell\history.ps1` owns per-pane PSReadLine history. `wezterm.lua`
 only assembles them. This note covers the state model, the invariants a future
-change must not break, the two details that cost the most to learn, the
-post-restore self-check, and the known limits. Where this note states a
-behaviour, it names the spec or scenario that pins it; limits are sourced from
-the plan.
+change must not break, window mode, the two details that cost the most to
+learn, the post-restore self-check, and the known limits. Where this note
+states a behaviour, it names the spec or scenario that pins it; limits name
+their source.
 
 ## State model
 
@@ -49,10 +49,12 @@ memoized so repeated saves cannot mint several files", "two instances own two
 files and restore reads the newest". Integration scenario `two_instances`
 checks `no_overwrite_idle`, `read_latest_newest` and `peer_not_overwritten`.
 
-`window` is `{ cols, rows, active_tab, active_pane }`. `cols` and `rows` are
-the active tab's cell extent, taken from the maximum right and bottom edge of
-its pane rectangles, so the dividers are included. Restore passes them as the
-`width` and `height` of the mux spawn call, which are cells, not pixels.
+`window` is `{ cols, rows, mode, active_tab, active_pane }`. `mode` is
+optional in files written before it existed; the window mode section covers it.
+`cols` and `rows` are the active tab's cell extent, taken from the maximum right
+and bottom edge of its pane rectangles, so the dividers are included. Restore
+passes them as the `width` and `height` of the mux spawn call, which are cells,
+not pixels.
 
 `window.active_tab` is a one-based position in `tabs`. It is not a tab id.
 `window.active_pane` is a pane id, and pane ids in this build start at zero, so
@@ -121,6 +123,50 @@ override fail loudly, and the runner fingerprints the live directory to prove
 it did not change. State spec: "state directory honours
 WEZTERM_SESSION_STATE_DIR and its pinned fallback".
 
+## Window mode
+
+`window.mode` is `normal`, `maximized` or `fullscreen`. The field is optional in
+files written before it existed, and a missing value means `normal`;
+`state.validate` accepts the three names and refuses anything else. State spec:
+"a missing window mode means normal and keeps old states and pins valid",
+"window mode accepts normal, maximized and fullscreen and rejects anything
+else". Commit `bedb406`.
+
+Save reads fullscreen from `get_dimensions().is_full_screen`, and that flag is
+authoritative even when the pixel size does not fill the screen. This build has
+no maximized getter, so save infers maximized when the whole window covers at
+least 85 percent of the active screen's pixel area. The line sits between the
+measured anchors on this machine, a 1920x1200 screen: a normal 90x26 window
+covered 50.6 percent, a deliberately large windowed layout 80.5, a maximized
+window 91.2 and fullscreen 100. Save spec: "window mode separates the measured
+maximized window from a large windowed one", "collect records the measured
+window mode". Commit `ef68557`.
+
+Restore applies the mode before it replays any split. Fullscreen is toggled
+through the GUI window, not the mux window. Restore then polls the pane grid in
+0.1 second steps for up to about three seconds until its columns and rows match
+the saved cells. A failed fullscreen toggle logs and still replays on the
+current grid. A grid that never matches logs the mismatch and also replays
+there, before the self-check can report drift. The events are
+`restore.mode_applied mode=<value>` on success,
+`restore.mode_failed mode=fullscreen` on a failed toggle, and
+`restore.mode_grid_mismatch` with `expected_cols`, `expected_rows`,
+`actual_cols` and `actual_rows` on a grid that never matches. Layout spec: "a
+maximized state maximizes before replaying on the matched grid", "a fullscreen
+state performs the toggle before replaying on the matched grid", "fullscreen
+without a GUI window logs mode_failed and still replays", "a grid that never
+matches replays and logs the mismatch before any drift". Commits `bedb406`,
+`5a2bc47` and `562194d`.
+
+A pin saved before the field existed is valid and restores as normal, and a pin
+wins restore until it is replaced, so re-pin to record a mode. State spec: "a
+missing window mode means normal and keeps old states and pins valid"; layout
+spec: "an old state without a mode restores as a normal window". Integration
+scenarios `maximized_roundtrip` (24 checks) and `fullscreen_roundtrip` (28
+checks) prove the save and restore round trips for each mode. The runner
+includes them only with `-WindowModes`; a routine `-All` or `-Integration` run
+leaves them out because they take over the screen. Commit `8cf7466`.
+
 ## Restore precedence
 
 Startup reads `pinned.json` before any session file. A valid pin wins over
@@ -174,10 +220,10 @@ this invariant.
 
 ### Only the instance whose fingerprint changed writes
 
-The fingerprint covers the schema version, the window cell size, the active tab
-position and active pane id, every tab title, and every pane id, rectangle and
-cwd. It excludes `saved_at` and `instance`, so a save that only touches the
-clock is not a change. It also excludes the foreground program record, which
+The fingerprint covers the schema version, the window cell size, window mode,
+the active tab position and active pane id, every tab title, and every pane id,
+rectangle and cwd. It excludes `saved_at` and `instance`, so a save that only
+touches the clock is not a change. It also excludes the foreground program record, which
 the plan's fingerprint definition does not list.
 
 By default the detector collects the live window once a second, fingerprints
@@ -297,13 +343,13 @@ quiet", "a self-check error is logged and never falls back".
 
 ## Known limitations
 
-Restore produces the saved cell size, not an OS-maximized window. This build
-exposes no maximized state to read, so a maximized window and a window created
-at the same cell size save the same state, and restore cannot know the OS had
-maximized it. A monitor or DPI change can also clip the restored window. The
-fresh-window fallback is the one path that maximizes. The plan records this
-limit at "Restored rectangles are exact in cells, but a monitor or DPI change
-can clip the window".
+Restore can bring a window back maximized or fullscreen, but maximized remains
+an inference. The rule saves any window covering at least 85 percent of the
+active screen as maximized, so a deliberately large windowed layout above that
+line comes back maximized. The measured 80.5 percent case is one windowed
+layout below the line, not proof that every large windowed layout stays below
+it. Save spec: "window mode separates the measured maximized window from a large
+windowed one". Commit `ef68557`.
 
 A live shell that picks up a changed history key mid-session keeps the history
 it already loaded. Restore sets the key in the environment of a fresh shell;

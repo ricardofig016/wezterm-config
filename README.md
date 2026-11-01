@@ -51,6 +51,9 @@ its own. A pin is a snapshot: after you rearrange panes deliberately, press
 `Alt+P` again, or restore keeps bringing back the old arrangement. `Alt+P`
 shows ` pinned HH:MM:SS ` in the status area; `Alt+Shift+P` shows ` unpinned `
 or ` nothing pinned `. Unpinning returns restore to the newest session file.
+A maximized or fullscreen window comes back in that mode. A pin made before
+this feature stays valid but carries no mode, so it restores as a normal
+window; press `Alt+P` again to record the current mode.
 
 ## Test
 
