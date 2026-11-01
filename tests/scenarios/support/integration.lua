@@ -446,4 +446,84 @@ function M.check_maximized_fallback(add, infos)
     return all_ok
 end
 
+-- The first GUI window, or nil. GuiWindow owns maximize, toggle_fullscreen and
+-- get_dimensions; the mux window used for layout does not.
+function M.first_gui_window()
+    local ok, windows = pcall(wezterm.gui.gui_windows)
+    if ok and type(windows) == "table" and #windows > 0 then
+        return windows[1]
+    end
+    return nil
+end
+
+-- window:get_dimensions() as a plain table, or nil. This build reports
+-- pixel_width, pixel_height, dpi and is_full_screen; it has no maximized flag.
+function M.dimensions(gui_window)
+    if gui_window == nil then
+        return nil
+    end
+    local ok, dims = pcall(gui_window.get_dimensions, gui_window)
+    if ok and type(dims) == "table" then
+        return dims
+    end
+    return nil
+end
+
+-- Poll until get_dimensions() reports want_full_screen and the pixel size has
+-- been identical for three consecutive reads, then hand the table to on_ready.
+-- A maximize or fullscreen transition changes the grid after the call returns,
+-- so no assertion may measure the first read.
+function M.await_dimensions(gui_window, want_full_screen, timeout_seconds, on_ready, on_timeout)
+    local deadline = os.time() + (timeout_seconds or 8)
+    local last_width, last_height, stable = nil, nil, 0
+    local function tick()
+        local dims = M.dimensions(gui_window)
+        local usable = dims ~= nil
+            and dims.is_full_screen == want_full_screen
+            and type(dims.pixel_width) == "number"
+            and type(dims.pixel_height) == "number"
+            and dims.pixel_width > 0
+            and dims.pixel_height > 0
+        if usable then
+            if dims.pixel_width == last_width and dims.pixel_height == last_height then
+                stable = stable + 1
+            else
+                stable = 0
+            end
+            last_width, last_height = dims.pixel_width, dims.pixel_height
+            if stable >= 2 then
+                on_ready(dims)
+                return
+            end
+        else
+            stable = 0
+        end
+        if os.time() >= deadline then
+            on_timeout(string.format(
+                "dimensions did not settle (want is_full_screen=%s, last=%sx%s)",
+                tostring(want_full_screen), tostring(last_width), tostring(last_height)))
+            return
+        end
+        wezterm.time.call_after(0.1, tick)
+    end
+    wezterm.time.call_after(0.1, tick)
+end
+
+-- Raw session.log lines that contain both plain substrings. Callers pass
+-- "event=restore.mode_applied" and " mode=maximized" so a quoted or extra field
+-- elsewhere on the line cannot satisfy the match by accident.
+function M.count_log_lines(report_path, event_text, field_text)
+    local count = 0
+    local found = {}
+    for _, entry in ipairs(M.log_lines(report_path)) do
+        if entry.line:find(event_text, 1, true)
+            and (field_text == nil or entry.line:find(field_text, 1, true))
+        then
+            count = count + 1
+            found[#found + 1] = entry.line
+        end
+    end
+    return count, found
+end
+
 return M

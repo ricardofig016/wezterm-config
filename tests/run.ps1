@@ -8,6 +8,10 @@ param(
     [switch]$Integration,
     # Unit plus shell plus integration.
     [switch]$All,
+    # Add the two real window-mode proofs (maximized and fullscreen round trip).
+    # They seize the screen, so the routine -All run leaves them out; only
+    # -All -WindowModes or -Integration -WindowModes includes them.
+    [switch]$WindowModes,
     # Parallel integration scenarios. Each one already owns an isolated state
     # directory, so the pool is safe; pid ownership is per launch.
     [int]$Jobs = 4
@@ -612,8 +616,16 @@ function Invoke-IntegrationSuite {
         return
     }
 
+    # Only -WindowModes adds the two scenarios that put a real window on screen.
+    # They are part of an explicit proof run, never of the routine suite: -All
+    # alone still runs exactly the core scenarios, and an -Integration run
+    # without the switch does too.
+    $windowModeScenarios = @('maximized_roundtrip.lua', 'fullscreen_roundtrip.lua')
     $scenarioFiles = @(Get-ChildItem -LiteralPath $scenariosDir -Filter '*.lua' -File -ErrorAction Stop |
         Sort-Object Name)
+    if (-not $WindowModes) {
+        $scenarioFiles = @($scenarioFiles | Where-Object { $windowModeScenarios -notcontains $_.Name })
+    }
     if ($scenarioFiles.Count -eq 0) {
         Write-Output "FAIL integration: no scenario files in $scenariosDir"
         return
@@ -947,10 +959,15 @@ function Invoke-AllSuites {
     $env:WEZTERM_SESSION_RUNNER_JOBS = [string]$Jobs
 
     $suites = @(
-        [pscustomobject]@{ Name = 'unit'; Switch = '-Unit' },
-        [pscustomobject]@{ Name = 'shell'; Switch = '-Shell' },
-        [pscustomobject]@{ Name = 'integration'; Switch = '-Integration' }
+        [pscustomobject]@{ Name = 'unit'; Arguments = @('-Unit') },
+        [pscustomobject]@{ Name = 'shell'; Arguments = @('-Shell') },
+        [pscustomobject]@{ Name = 'integration'; Arguments = @('-Integration') }
     )
+    # -All -WindowModes must carry the switch into the integration child, or
+    # that child would run the routine suite and silently drop the two proofs.
+    if ($WindowModes) {
+        $suites[2].Arguments = @('-Integration', '-WindowModes')
+    }
     $runs = @()
 
     try {
@@ -958,7 +975,7 @@ function Invoke-AllSuites {
             $outPath = Join-Path $tempDir ($suite.Name + '.stdout.log')
             $errPath = Join-Path $tempDir ($suite.Name + '.stderr.log')
             $process = Start-Process -FilePath $pwshPath `
-                -ArgumentList @('-NoProfile', '-File', $PSCommandPath, $suite.Switch) `
+                -ArgumentList (@('-NoProfile', '-File', $PSCommandPath) + $suite.Arguments) `
                 -PassThru `
                 -RedirectStandardOutput $outPath `
                 -RedirectStandardError $errPath
