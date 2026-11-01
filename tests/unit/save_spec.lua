@@ -94,6 +94,28 @@ local function one_tab_window(pane_opts, tab_title)
     }), pane
 end
 
+local MEASURED_SCREEN = { width = 1920, height = 1200 }
+
+local function window_with_dimensions(dimensions, pane_opts)
+    local window, pane = one_tab_window(pane_opts or { id = 1, cwd = "/C:/work" })
+    function window:get_dimensions()
+        return dimensions
+    end
+    return window, pane
+end
+
+local function with_screens(screen, fn)
+    local real_screens = wezterm.gui.screens
+    wezterm.gui.screens = function()
+        return { active = screen, main = screen, by_name = {} }
+    end
+    local ok, err = pcall(fn)
+    wezterm.gui.screens = real_screens
+    if not ok then
+        error(err, 0)
+    end
+end
+
 local function status_window(pane_opts, tab_title)
     local window, pane = one_tab_window(pane_opts, tab_title)
     window.status = nil
@@ -258,6 +280,7 @@ return {
             t.eq(snapshot.window, {
                 cols = 120,
                 rows = 24,
+                mode = "normal",
                 active_tab = 2,
                 active_pane = 21,
             })
@@ -294,6 +317,91 @@ return {
                 state.fingerprint(again),
                 "saved_at and identity must not affect the fingerprint"
             )
+        end,
+    },
+    {
+        name = "window mode separates the measured maximized window from a large windowed one",
+        run = function(t)
+            local cases = {
+                {
+                    label = "normal 90x26 window at 1288x906",
+                    dimensions = { pixel_width = 1288, pixel_height = 906, dpi = 144, is_full_screen = false },
+                    expected = "normal",
+                },
+                {
+                    label = "maximized window at 1920x1094",
+                    dimensions = { pixel_width = 1920, pixel_height = 1094, dpi = 144, is_full_screen = false },
+                    expected = "maximized",
+                },
+                {
+                    label = "large windowed window at 1800x1030",
+                    dimensions = { pixel_width = 1800, pixel_height = 1030, dpi = 144, is_full_screen = false },
+                    expected = "normal",
+                },
+                {
+                    label = "fullscreen window at 1920x1200",
+                    dimensions = { pixel_width = 1920, pixel_height = 1200, dpi = 144, is_full_screen = true },
+                    expected = "fullscreen",
+                },
+            }
+            for _, case in ipairs(cases) do
+                t.eq(save.window_mode(case.dimensions, MEASURED_SCREEN), case.expected, case.label)
+            end
+
+            t.ok(
+                0.8047 < save.MAXIMIZED_AREA_RATIO and save.MAXIMIZED_AREA_RATIO < 0.9117,
+                "the threshold must sit between the measured large-windowed and maximized coverage"
+            )
+            t.eq(
+                save.window_mode({
+                    pixel_width = 1288,
+                    pixel_height = 906,
+                    dpi = 144,
+                    is_full_screen = true,
+                }, MEASURED_SCREEN),
+                "fullscreen",
+                "the fullscreen flag must win even when the pixels do not fill the screen"
+            )
+            t.eq(save.window_mode(nil, MEASURED_SCREEN), "normal", "missing dimensions must not crash or guess")
+            t.eq(save.window_mode({ pixel_width = 1920, pixel_height = 1094 }, nil), "normal",
+                "missing screen information must not guess maximized")
+        end,
+    },
+    {
+        name = "collect records the measured window mode",
+        run = function(t)
+            local cases = {
+                {
+                    label = "normal",
+                    dimensions = { pixel_width = 1288, pixel_height = 906, dpi = 144, is_full_screen = false },
+                    expected = "normal",
+                },
+                {
+                    label = "maximized",
+                    dimensions = { pixel_width = 1920, pixel_height = 1094, dpi = 144, is_full_screen = false },
+                    expected = "maximized",
+                },
+                {
+                    label = "large windowed",
+                    dimensions = { pixel_width = 1800, pixel_height = 1030, dpi = 144, is_full_screen = false },
+                    expected = "normal",
+                },
+                {
+                    label = "fullscreen",
+                    dimensions = { pixel_width = 1920, pixel_height = 1200, dpi = 144, is_full_screen = true },
+                    expected = "fullscreen",
+                },
+            }
+            for _, case in ipairs(cases) do
+                local window = window_with_dimensions(case.dimensions, { id = 1, cwd = "/C:/work" })
+                with_screens(MEASURED_SCREEN, function()
+                    local snapshot, err = save.collect(window)
+                    t.ok(snapshot ~= nil, case.label .. ": " .. tostring(err))
+                    if snapshot ~= nil then
+                        t.eq(snapshot.window.mode, case.expected, case.label)
+                    end
+                end)
+            end
         end,
     },
     {

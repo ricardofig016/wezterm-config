@@ -20,6 +20,13 @@ M.DEBOUNCE_MS = M.DEFAULT_DEBOUNCE_MS
 M.STATUS_SECONDS = 3
 M.FAILURE_STATUS_SECONDS = 10
 
+-- Measured on this machine (screen 1920x1200): a maximized window covered
+-- 1920x1094 (91.2% of the screen), a deliberately large windowed window covered
+-- 1800x1030 (80.5%), and a normal 90x26 window covered 1288x906 (50.6%). The
+-- 85% line separates the two large cases without relying on a fixed chrome or
+-- taskbar height, which changes with DPI and Windows settings.
+M.MAXIMIZED_AREA_RATIO = 0.85
+
 local started = false
 local started_at
 local last_written
@@ -70,6 +77,60 @@ end
 
 local function now_seconds()
     return os.time()
+end
+
+-- Pure mode decision so unit tests can use the measured pixel numbers. The
+-- fullscreen flag is authoritative; maximized is inferred from the fraction of
+-- the active screen the whole window covers.
+function M.window_mode(dimensions, screen)
+    if type(dimensions) == "table" and dimensions.is_full_screen == true then
+        return "fullscreen"
+    end
+    if type(dimensions) ~= "table" or type(screen) ~= "table" then
+        return "normal"
+    end
+
+    local pixel_width = tonumber(dimensions.pixel_width)
+    local pixel_height = tonumber(dimensions.pixel_height)
+    local screen_width = tonumber(screen.width)
+    local screen_height = tonumber(screen.height)
+    if
+        pixel_width == nil
+        or pixel_height == nil
+        or screen_width == nil
+        or screen_height == nil
+        or pixel_width <= 0
+        or pixel_height <= 0
+        or screen_width <= 0
+        or screen_height <= 0
+    then
+        return "normal"
+    end
+
+    local covered = (pixel_width * pixel_height) / (screen_width * screen_height)
+    if covered >= M.MAXIMIZED_AREA_RATIO then
+        return "maximized"
+    end
+    return "normal"
+end
+
+local function collect_window_mode(window)
+    local get_dimensions = window.get_dimensions
+    if type(get_dimensions) ~= "function" then
+        return "normal"
+    end
+
+    local dimensions_ok, dimensions = pcall(get_dimensions, window)
+    if not dimensions_ok then
+        return "normal"
+    end
+
+    local screen
+    local screens_ok, screens = pcall(wezterm.gui.screens)
+    if screens_ok and type(screens) == "table" then
+        screen = screens.active or screens.main
+    end
+    return M.window_mode(dimensions, screen)
 end
 
 local function instance_started_at()
@@ -295,6 +356,7 @@ function M.collect(window)
         snapshot.window = {
             cols = active_size.width,
             rows = active_size.height,
+            mode = collect_window_mode(window),
             active_tab = active_tab,
             active_pane = active_size.active_pane,
         }
