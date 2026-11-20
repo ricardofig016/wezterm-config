@@ -771,7 +771,9 @@ return {
             local tree = layout.plan(three_pane_rects)
             t.ok(tree ~= nil, "plan returned nil")
 
-            local created, expected, by_leaf = layout.replay(root, tree, three_pane_saved)
+            local saved = deep_copy(three_pane_saved)
+            saved[2].history_key = "h-0123456789abcdef0123456789abcdef"
+            local created, expected, by_leaf = layout.replay(root, tree, saved)
             t.ok(created ~= nil, "replay failed: " .. tostring(expected))
             t.eq(#created, 2)
             t.eq(#calls, 2)
@@ -781,7 +783,7 @@ return {
             t.eq(calls[1].args.size, 100)
             t.eq(calls[1].args.cwd, "C:\\b")
             t.eq(calls[1].args.set_environment_variables, {
-                WEZTERM_SESSION_HISTORY_KEY = "11",
+                WEZTERM_SESSION_HISTORY_KEY = "h-0123456789abcdef0123456789abcdef",
             })
             t.ok(created[1] == calls[1].child, "replay must return the panes it created")
 

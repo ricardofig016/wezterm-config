@@ -43,8 +43,14 @@ local wezterm = require("wezterm")
 
 local state = require("lib.state")
 local log = require("lib.log")
+local config = require("lib.config")
 
 local M = {}
+local restored_history_keys = {}
+
+function M.restored_history_key(pane_id)
+    return restored_history_keys[pane_id]
+end
 
 -- Foreground programs are typed once the pane's shell answers the foreground
 -- process query. Poll a bounded number of times, then give up quietly.
@@ -256,6 +262,35 @@ local function count_leaves(node)
     return count_leaves(node.first) + count_leaves(node.second)
 end
 
+local function history_key_for_restore(pane)
+    if pane.history_key == nil then
+        -- Older snapshots used the saved numeric pane ID as the filename.
+        return tostring(pane.id)
+    end
+    return pane.history_key or ""
+end
+
+local function with_history_env(args, saved_pane)
+    -- This WezTerm build forwards spawn environment overrides only with argv.
+    if args.args == nil or #args.args == 0 then
+        args.args = config.default_program()
+        -- With argv supplied, split can inherit the parent pane's cwd.
+        if args.cwd ~= "" then
+            args.args[#args.args + 1] = "-WorkingDirectory"
+            args.args[#args.args + 1] = args.cwd
+        end
+    end
+    local variables = {}
+    if type(args.set_environment_variables) == "table" then
+        for key, value in pairs(args.set_environment_variables) do
+            variables[key] = value
+        end
+    end
+    variables.WEZTERM_SESSION_HISTORY_KEY = history_key_for_restore(saved_pane)
+    args.set_environment_variables = variables
+    return args
+end
+
 function M.replay(pane, tree, panes)
     if pane == nil or type(tree) ~= "table" or type(panes) ~= "table" then
         return nil, "replay needs a pane, a plan tree and the saved panes"
@@ -322,14 +357,11 @@ function M.replay(pane, tree, panes)
                 error("saved pane " .. tostring(created_index) .. " has no cwd")
             end
 
-            local child = target:split({
+            local child = target:split(with_history_env({
                 direction = direction,
                 size = cells,
                 cwd = created_pane.cwd,
-                set_environment_variables = {
-                    WEZTERM_SESSION_HISTORY_KEY = tostring(created_pane.id),
-                },
-            })
+            }, created_pane))
             if child == nil then
                 error("pane:split returned no pane")
             end
@@ -355,18 +387,6 @@ local function spawn_args(cmd)
             args[key] = value
         end
     end
-    return args
-end
-
-local function with_history_env(args, saved_pane)
-    local variables = {}
-    if type(args.set_environment_variables) == "table" then
-        for key, value in pairs(args.set_environment_variables) do
-            variables[key] = value
-        end
-    end
-    variables.WEZTERM_SESSION_HISTORY_KEY = tostring(saved_pane.id)
-    args.set_environment_variables = variables
     return args
 end
 
@@ -842,6 +862,15 @@ function M.restore(cmd, latest, pinned)
 
         for tab_index, plan in ipairs(plans) do
             for leaf, saved_pane in ipairs(plan.saved.panes) do
+                local pane_object = plan.by_leaf[leaf]
+                local key = history_key_for_restore(saved_pane)
+                -- A snapshot can run before the restored shell's first prompt.
+                if pane_object and state.valid_history_key(key) then
+                    local id_ok, id = pcall(pane_object.pane_id, pane_object)
+                    if id_ok and type(id) == "number" then
+                        restored_history_keys[id] = key
+                    end
+                end
                 local foreground = saved_pane.foreground
                 if
                     foreground ~= nil
@@ -849,7 +878,6 @@ function M.restore(cmd, latest, pinned)
                     and type(foreground.argv) == "table"
                     and #foreground.argv > 0
                 then
-                    local pane_object = plan.by_leaf[leaf]
                     if pane_object ~= nil then
                         local scheduled = pcall(
                             schedule_foreground,
