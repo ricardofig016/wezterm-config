@@ -1,8 +1,8 @@
 # Per-pane PSReadLine history and the OSC 7 prompt hook.
 #
 # Dot-source this file from $PROFILE. Restored panes carry
-# WEZTERM_SESSION_HISTORY_KEY (the saved pane id); panes created by hand carry
-# only WEZTERM_PANE. Either selects
+# WEZTERM_SESSION_HISTORY_KEY. New panes generate a unique key. The shell
+# reports the key to WezTerm for the next snapshot. The key selects
 #   <state dir>\history\<key>.txt
 # where <state dir> is WEZTERM_SESSION_STATE_DIR when set, otherwise
 # %APPDATA%\wezterm-session-layer. A shell outside WezTerm has neither
@@ -16,9 +16,8 @@
 # Remove-Module followed by Import-Module was measured not to reload them, and
 # PSReadLine exposes no public reload.
 
-# The prompt function is unchanged from the profile it replaces: it emits the
-# OSC 7 current-directory sequence that per-pane cwd restore reads, then prints
-# the traditional "PS <path>> " prompt.
+# The prompt reports the history key and current directory to WezTerm.
+$script:weztermHistorySequence = ""
 function prompt {
     $p = $executionContext.SessionState.Path.CurrentLocation
     $osc7 = ""
@@ -27,18 +26,22 @@ function prompt {
         $path = $p.ProviderPath -replace "\\", "/"
         $osc7 = "$ansi]7;file://${env:COMPUTERNAME}/${path}$ansi\"
     }
-    "${osc7}PS $p$('>' * ($nestedPromptLevel + 1)) "
+    "$script:weztermHistorySequence${osc7}PS $p$('>' * ($nestedPromptLevel + 1)) "
 }
 
 try {
     # A scriptblock keeps the helper variables out of the caller's scope.
     & {
-        $key = $env:WEZTERM_SESSION_HISTORY_KEY
-        if ([string]::IsNullOrWhiteSpace($key) -or $key -notmatch '^[0-9]+$') {
-            $key = $env:WEZTERM_PANE
-        }
-        if ([string]::IsNullOrWhiteSpace($key) -or $key -notmatch '^[0-9]+$') {
+        if ($env:WEZTERM_PANE -notmatch '^[0-9]+$') {
             return
+        }
+        $key = $env:WEZTERM_SESSION_HISTORY_KEY
+        Remove-Item Env:WEZTERM_SESSION_HISTORY_KEY -ErrorAction SilentlyContinue
+        if (-not $key -and $env:WEZTERM_SESSION_HISTORY_PANE -eq $env:WEZTERM_PANE) {
+            $key = $env:WEZTERM_SESSION_PANE_HISTORY
+        }
+        if ($key -notmatch '\A(?:[0-9]+|h-[a-f0-9]{32})\z') {
+            $key = 'h-' + [guid]::NewGuid().ToString('N')
         }
 
         $stateDir = $env:WEZTERM_SESSION_STATE_DIR
@@ -67,6 +70,11 @@ try {
 
         Import-Module PSReadLine -ErrorAction Stop
         Set-PSReadLineOption -HistorySavePath $historyPath -ErrorAction Stop
+        # Nested PowerShell processes in the same pane reuse its history.
+        $env:WEZTERM_SESSION_HISTORY_PANE = $env:WEZTERM_PANE
+        $env:WEZTERM_SESSION_PANE_HISTORY = $key
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($key))
+        $script:weztermHistorySequence = "$([char]27)]1337;SetUserVar=WEZTERM_SESSION_HISTORY_KEY=$encoded$([char]7)"
     }
 } catch {
     # History setup must never stop a shell from starting. On any failure the

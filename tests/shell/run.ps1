@@ -37,13 +37,13 @@ $cases = @(
         ExpectHistoryDir = $true
     },
     [pscustomobject]@{
-        Name = 'pane-fallback'
+        Name = 'fresh-pane-ignores-reused-numeric-id'
         HistoryKey = $null
         Pane = '4102'
         UseStateEnv = $true
         SeedHistory = $true
         PaneItems = @('pane-4102-one', 'pane-4102-two')
-        ExpectedItems = @('pane-4102-one', 'pane-4102-two')
+        ExpectedItems = @()
         ExpectHistoryDir = $true
     },
     [pscustomobject]@{
@@ -60,8 +60,8 @@ $cases = @(
         # The hook must create <state dir>\history even before the pane has a
         # saved command. No pane file is seeded for this case.
         Name = 'creates-directory'
-        HistoryKey = '4103'
-        Pane = $null
+        HistoryKey = 'h-0123456789abcdef0123456789abcdef'
+        Pane = '9003'
         UseStateEnv = $true
         SeedHistory = $false
         PaneItems = @()
@@ -154,8 +154,21 @@ function Invoke-HistoryCase {
             throw 'child produced no JSON result'
         }
 
-        Assert-True ($result.HistorySavePath -eq $expectedPath) `
-            "HistorySavePath was '$($result.HistorySavePath)', expected '$expectedPath'"
+        if ($Case.Pane -and -not $Case.HistoryKey) {
+            $filename = Split-Path -Leaf $result.HistorySavePath
+            Assert-True ($result.HistoryDirectory -eq $expectedHistoryDir -and $filename -match '^h-[a-f0-9]{32}\.txt$') `
+                "fresh pane selected an unexpected path '$($result.HistorySavePath)'"
+        } else {
+            Assert-True ($result.HistorySavePath -eq $expectedPath) `
+                "HistorySavePath was '$($result.HistorySavePath)', expected '$expectedPath'"
+        }
+
+        if ($Case.Pane) {
+            $key = [IO.Path]::GetFileNameWithoutExtension($result.HistorySavePath)
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($key))
+            Assert-True ($result.Prompt.Contains("SetUserVar=WEZTERM_SESSION_HISTORY_KEY=$encoded$([char]7)")) `
+                'prompt did not report the history key used by PSReadLine'
+        }
 
         $actualItems = @($result.Items)
         Assert-True ($actualItems.Count -eq $Case.ExpectedItems.Count) `
