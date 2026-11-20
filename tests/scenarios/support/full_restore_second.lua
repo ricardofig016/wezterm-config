@@ -180,24 +180,20 @@ wezterm.on("gui-startup", function(_cmd)
                     height = info.height,
                 })] = info
             end
-            local cwd_mismatch, checked_cwds = nil, 0
-            for _, pane in ipairs(saved_tab.panes) do
-                local info = live_by_rect[rect_key(pane.rect)]
-                if info == nil then
-                    cwd_mismatch = "no live pane for saved rect " .. rect_key(pane.rect)
-                    break
-                end
-                checked_cwds = checked_cwds + 1
-                local live_ok, live_url = pcall(info.pane.get_current_working_dir, info.pane)
-                local live_cwd = live_ok and normalize_cwd(live_url) or nil
-                if live_cwd ~= normalize_cwd(pane.cwd) then
-                    cwd_mismatch = string.format("saved %s live %s", tostring(pane.cwd),
-                        tostring(live_cwd))
-                    break
+            local function cwd_mismatch()
+                for _, pane in ipairs(saved_tab.panes) do
+                    local info = live_by_rect[rect_key(pane.rect)]
+                    if info == nil then
+                        return "no live pane for saved rect " .. rect_key(pane.rect)
+                    end
+                    local live_ok, live_url = pcall(info.pane.get_current_working_dir, info.pane)
+                    local live_cwd = live_ok and normalize_cwd(live_url) or nil
+                    if live_cwd ~= normalize_cwd(pane.cwd) then
+                        return string.format("saved %s live %s", tostring(pane.cwd),
+                            tostring(live_cwd))
+                    end
                 end
             end
-            add("panes_cwd", cwd_mismatch == nil,
-                cwd_mismatch or (checked_cwds .. " pane(s) match"))
 
             -- Title.
             local title_ok, live_title = pcall(tab.get_title, tab)
@@ -262,7 +258,18 @@ wezterm.on("gui-startup", function(_cmd)
                 "restore.plan_failed",
             })
 
-            finish()
+            -- A restored shell may report its startup directory before its first prompt.
+            local deadline = os.time() + 5
+            local function await_cwds()
+                local mismatch = cwd_mismatch()
+                if mismatch and os.time() < deadline then
+                    wezterm.time.call_after(0.1, await_cwds)
+                    return
+                end
+                add("panes_cwd", mismatch == nil, mismatch or (#saved_tab.panes .. " pane(s) match"))
+                finish()
+            end
+            await_cwds()
         end, function(message)
             add("layout_settled", false, message)
             finish()

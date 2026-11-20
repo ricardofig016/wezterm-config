@@ -197,6 +197,7 @@ wezterm.on("gui-startup", function(_cmd)
                     mapping[index] = {
                         live = infos[1].pane,
                         saved_id = saved_tab.panes[1].id,
+                        history_key = saved_tab.panes[1].history_key,
                         command = expected.commands[tostring(saved_tab.panes[1].id)],
                     }
                 end
@@ -233,6 +234,9 @@ wezterm.on("gui-startup", function(_cmd)
             end
 
             query_pane = function(entry)
+                local key = entry.live:get_user_vars().WEZTERM_SESSION_HISTORY_KEY
+                add("restored_key_" .. tostring(entry.saved_id), key == entry.history_key,
+                    "saved key " .. tostring(entry.history_key) .. ", live key " .. tostring(key))
                 local sent = pcall(entry.live.send_text, entry.live, QUERY .. "\r")
                 add("query_sent_" .. tostring(entry.saved_id), sent,
                     "typed history query in pane " .. tostring(entry.saved_id))
@@ -263,7 +267,7 @@ wezterm.on("gui-startup", function(_cmd)
                         end
                         add("pane_history_" .. tostring(entry.saved_id), ok, item_detail)
 
-                        local file_ok, file_text = contains(history_path(entry.saved_id),
+                        local file_ok, file_text = contains(history_path(entry.history_key),
                             entry.command)
                         local sibling_in_file = false
                         for _, other in pairs(mapping) do
@@ -277,7 +281,7 @@ wezterm.on("gui-startup", function(_cmd)
                         add("pane_file_" .. tostring(entry.saved_id),
                             file_ok and not sibling_in_file,
                             string.format("path=%s own=%s sibling=%s text=%q",
-                                history_path(entry.saved_id), tostring(file_ok),
+                                history_path(entry.history_key), tostring(file_ok),
                                 tostring(sibling_in_file), tostring(file_text)))
                         pane_done()
                         return

@@ -158,11 +158,15 @@ wezterm.on("gui-startup", function(_cmd)
             local history_polls = 0
             wait_for_history = function(first_id, second_id)
                 history_polls = history_polls + 1
-                local one_ok, one_text = contains(history_path(first_id), COMMAND_ONE)
-                local two_ok, two_text = contains(history_path(second_id), COMMAND_TWO)
+                local one_key = root:get_user_vars().WEZTERM_SESSION_HISTORY_KEY
+                local two_key = pane_two:get_user_vars().WEZTERM_SESSION_HISTORY_KEY
+                local one_ok, one_text = contains(history_path(one_key), COMMAND_ONE)
+                local two_ok, two_text = contains(history_path(two_key), COMMAND_TWO)
                 local one_has_two = (one_text or ""):find(COMMAND_TWO, 1, true) ~= nil
                 local two_has_one = (two_text or ""):find(COMMAND_ONE, 1, true) ~= nil
                 if one_ok and two_ok then
+                    add("new_history_keys", one_key:match("^h%-") and two_key:match("^h%-")
+                        and one_key ~= two_key, "new tabs use distinct history keys")
                     add("history_file_one", one_has_two == false,
                         "pane " .. tostring(first_id) .. " history: " .. tostring(one_text))
                     add("history_file_two", two_has_one == false,
@@ -194,6 +198,8 @@ wezterm.on("gui-startup", function(_cmd)
                     and #snapshot.tabs == 2
                     and snapshot.tabs[1].title == TITLE_ONE
                     and snapshot.tabs[2].title == TITLE_TWO
+                    and state.valid_history_key(snapshot.tabs[1].panes[1].history_key)
+                    and state.valid_history_key(snapshot.tabs[2].panes[1].history_key)
                 then
                     saved(snapshot, first_id, second_id)
                     return
