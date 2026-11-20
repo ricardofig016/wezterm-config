@@ -181,6 +181,12 @@ local function valid_foreground(foreground)
     return type(foreground.alt_screen) == "boolean"
 end
 
+function M.valid_history_key(key)
+    return type(key) == "string"
+        and (key:match("^[0-9]+$") ~= nil
+            or (#key == 34 and key:match("^h%-[a-f0-9]+$") ~= nil))
+end
+
 local function valid_pane(pane)
     if type(pane) ~= "table" then
         return false
@@ -192,6 +198,11 @@ local function valid_pane(pane)
         return false
     end
     if not is_string(pane.cwd) then
+        return false
+    end
+    if pane.history_key ~= nil and pane.history_key ~= false
+        and not M.valid_history_key(pane.history_key)
+    then
         return false
     end
     return valid_foreground(pane.foreground)
@@ -408,7 +419,7 @@ function M.fingerprint(t)
             for pane_index, pane in ipairs(panes) do
                 local rect = type(pane.rect) == "table" and pane.rect or {}
                 parts[#parts + 1] = string.format(
-                    "p%d.%d=%s,%s,%s,%s,%s,%s",
+                    "p%d.%d=%s,%s,%s,%s,%s,%s,%s",
                     tab_index,
                     pane_index,
                     tostring(pane.id),
@@ -416,7 +427,8 @@ function M.fingerprint(t)
                     tostring(rect.top),
                     tostring(rect.width),
                     tostring(rect.height),
-                    tostring(pane.cwd)
+                    tostring(pane.cwd),
+                    tostring(pane.history_key)
                 )
             end
         end
