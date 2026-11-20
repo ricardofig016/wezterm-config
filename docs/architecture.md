@@ -291,16 +291,7 @@ Top/Bottom direction vocabularies are pinned as data".
 
 ### Restore must set the history key per pane
 
-`pane:split` accepts `set_environment_variables`, and restore passes
-`WEZTERM_SESSION_HISTORY_KEY` equal to the saved pane id for every pane it
-creates. The window spawn and each `spawn_tab` pass it for the tab's root pane;
-each split passes it for the pane that split creates, which is the first leaf
-of the split's second subtree. The shell hook resolves that variable, then
-`WEZTERM_PANE`, then leaves the global history file alone. A pane whose split
-omits the key keys its history by the id this build assigned instead of the
-saved id, so it loses the history the state promised. Layout spec: "replay
-splits in plan order with cwd and the history key". The shell suite cases
-`restored-key`, `pane-fallback` and `no-key` cover the hook side.
+Each new PowerShell pane generates a unique history key. Its prompt reports the key via a WezTerm user variable, and the saver records it as `history_key`. Restore passes that key as `WEZTERM_SESSION_HISTORY_KEY` for window roots, tab roots, and split panes. A legacy snapshot without the field uses the saved numeric pane ID to find its existing file. A snapshot with `history_key = false` had no reported key, so the restored shell generates one.
 
 ## The settle window and a silent clean restore
 
@@ -358,12 +349,6 @@ prompt. In a shell that already loaded history, setting the path changes where
 new commands are saved but leaves the loaded items in memory. PSReadLine has no
 public reload, so only a freshly started shell honours the new path. The plan
 records this limit and `shell\history.ps1` repeats it.
-
-A closed pane leaves an id gap that can later collide with a hand-made pane's
-history file. Restored panes keep their saved ids through the history key, so
-their history survives, but a pane created by hand can later reuse a gap id and
-share a history file with a restored pane whose saved id matches. The plan
-records this edge. The suite does not exercise the collision itself.
 
 This build exposes no getter for the status text. The unit tests pin the string
 passed to the status setter through a fake window, and the `selfcheck_drift`

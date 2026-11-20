@@ -72,11 +72,7 @@ can stay on disk or be removed once the backups are restored.
 
 ## The state directory
 
-The default is
-`C:\Users\rfigueiredo\AppData\Roaming\wezterm-session-layer`, and
-`WEZTERM_SESSION_STATE_DIR` overrides it. It holds `sessions\<instance id>.json`
-for live instances, `history\<pane id>.txt` for per-pane PSReadLine history, and
-`session.log` with one rotated backup, `session.log.1`.
+The default is `C:\Users\rfigueiredo\AppData\Roaming\wezterm-session-layer`, and `WEZTERM_SESSION_STATE_DIR` overrides it. It holds `sessions\<instance id>.json` for live instances, `history\<history key>.txt` for per-pane PSReadLine history, and `session.log` with one rotated backup, `session.log.1`.
 
 Close WezTerm first, then delete the whole directory:
 
