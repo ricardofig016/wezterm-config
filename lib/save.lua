@@ -8,6 +8,7 @@
 local wezterm = require("wezterm")
 local state = require("lib.state")
 local log = require("lib.log")
+local layout = require("lib.layout")
 
 local M = {}
 
@@ -277,8 +278,14 @@ local function collect_tab(tab)
             cwd = foreground.cwd
         end
 
+        local vars_ok, vars = pcall(pane.get_user_vars, pane)
+        local history_key = vars_ok and type(vars) == "table" and vars.WEZTERM_SESSION_HISTORY_KEY
+        if not state.valid_history_key(history_key) then
+            history_key = layout.restored_history_key(id)
+        end
         panes[#panes + 1] = {
             id = id,
+            history_key = history_key or false,
             rect = {
                 left = info.left,
                 top = info.top,

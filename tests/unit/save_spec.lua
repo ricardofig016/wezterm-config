@@ -241,6 +241,9 @@ return {
                 id = 11,
                 cwd = "/C:/work/alpha",
             })
+            function first:get_user_vars()
+                return { WEZTERM_SESSION_HISTORY_KEY = "h-0123456789abcdef0123456789abcdef" }
+            end
             local foreground_pane = fake_pane({
                 id = 12,
                 cwd = { file_path = "/C:/work/beta" },
@@ -290,11 +293,13 @@ return {
             t.eq(snapshot.tabs[1].panes, {
                 {
                     id = 11,
+                    history_key = "h-0123456789abcdef0123456789abcdef",
                     rect = { left = 0, top = 0, width = 80, height = 24 },
                     cwd = "C:/work/alpha",
                 },
                 {
                     id = 12,
+                    history_key = false,
                     rect = { left = 80, top = 0, width = 40, height = 24 },
                     cwd = "C:/work/beta",
                     foreground = { argv = { "vim", "a.txt" }, alt_screen = true },
@@ -303,6 +308,7 @@ return {
             t.eq(snapshot.tabs[2].panes, {
                 {
                     id = 21,
+                    history_key = false,
                     rect = { left = 0, top = 0, width = 120, height = 24 },
                     cwd = "C:/work/gamma delta",
                 },
